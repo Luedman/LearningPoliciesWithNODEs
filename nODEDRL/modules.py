@@ -28,6 +28,9 @@ class ReplayMemory:
     def sample(self, batch_size):
         return random.sample(self._memory, batch_size)
 
+    def get_memory(self):
+        return self._memory
+
 
 class DQN(torch.nn.Module):
     def __init__(self, n_observation, n_actions):
@@ -59,20 +62,38 @@ class ODENet(torch.nn.Module):
                 torch.nn.init.constant_(m.bias, val=0)
 
     def forward(self, t, y):
-        return self.net(y)
+        net_output = self.net(y)
+        return net_output
 
 
-def select_action(state, params, policy_net, env, steps_done):
+def get_action_from_ode_net(ode_net, state, params):
+    with torch.no_grad():
+        policy = odeint(ode_net, torch.tensor([-1, -1.2, -0.07]), torch.linspace(-1, 1, 100))
+        idx_1 = (torch.abs(policy[:, 1] - torch.flatten(state)[0])).argmin()
+        idx_2 = (torch.abs(policy[:, 2] - torch.flatten(state)[1])).argmin()
+        action_1 = policy[idx_1][0]
+        action_2 = policy[idx_2][0]
+        action = torch.mean(torch.tensor([action_1, action_2], device=params.get("device")))
+        action = torch.reshape(action, (1,))
+    return action
+
+
+def select_action(state, params, env, steps_done, policy_net=None, ode_net=None):
     eps_threshold = params.get("eps_end") + (params.get("eps_start") - params.get("eps_end")) * math.exp(
         -1. * steps_done / params.get("eps_decay"))
     if steps_done % 1000 == 0 and False:
         print(f"eps: {eps_threshold} steps: {steps_done}")
     steps_done += 1
     with torch.no_grad():
-        if random.random() > eps_threshold:
+        rand = random.random()
+        if rand > eps_threshold and policy_net is not None:
             action = policy_net(state).max(1)[1].view(1, 1)
+        elif rand > eps_threshold and ode_net is not None:
+            action = get_action_from_ode_net(ode_net, state, params)
         else:
-            action = torch.tensor([[env.action_space.sample()]], device=params.get("device"), dtype=torch.long)
+            action = torch.tensor(env.action_space.sample().reshape(1, 1, 1, ),
+                                  device=params.get("device"),
+                                  dtype=torch.float)
     return action, eps_threshold
 
 
@@ -150,18 +171,18 @@ def optimize_model(policy_net, target_net, replay_memory, params, optimizer):
     return loss.item()
 
 
-def run_training(env, num_episodes, replay_memory, target_net, policy_net, params):
+def run_training(env, replay_memory, target_net, policy_net, params):
     steps_done = 0
     episode_durations = []
     episode_epsilon_end = []
     episode_training_error = []
     device = params.get("device")
-
-    for i_episode in range(num_episodes):
+    optimizer = torch.optim.AdamW(policy_net.parameters(), lr=params.get("learning_rate"), amsgrad=True)
+    for i_episode in range(params.get("no_episodes")):
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         for t in count():
-            action, eps_threshold = select_action(state, params, policy_net, env, device, steps_done)
+            action, eps_threshold = select_action(state, params, env, steps_done, policy_net=policy_net)
             observation, reward, terminated, truncated, _ = env.step(action.item())
             reward = torch.tensor([reward], device=device)
             done = terminated or truncated
@@ -174,7 +195,7 @@ def run_training(env, num_episodes, replay_memory, target_net, policy_net, param
             replay_memory.push(state, action, next_state, reward)
             state = next_state
 
-            loss_value = optimize_model()
+            loss_value = optimize_model(policy_net, target_net, replay_memory, params, optimizer)
 
             target_net_state_dict = target_net.state_dict()
             policy_net_state_dict = policy_net.state_dict()
@@ -265,6 +286,9 @@ def runNeuralODE(x_axis_time, y_axis, z_axis, params):
                                cmap=matplotlib.cm.coolwarm, label="pred")
                     ax.scatter(y_true[:, 0].numpy(), y_true[:, 1].numpy(), y_true[:, 2].numpy(),
                                cmap=matplotlib.cm.coolwarm, label="true")
+                    ax.set_xlabel("time")
+                    ax.set_ylabel("y (x^3)")
+                    ax.set_zlabel("z (sin(y))")
                     plt.legend()
                     plt.title(itr)
                     plt.draw()
@@ -280,3 +304,95 @@ def runNeuralODE(x_axis_time, y_axis, z_axis, params):
     # plt.plot(loss_list)
     # plt.title("Loss")
     # plt.show()
+
+
+def runNeuralODE_gym(env, replay_memory, params):
+    steps_done = 0
+    episode_durations = []
+    episode_epsilon_end = []
+    episode_training_error = []
+    device = params.get("device")
+
+    plt.ion()
+    no_dims = 3
+
+    loss_list = []
+
+    ode_net = ODENet(no_dims)
+    optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
+
+    state, info = env.reset()
+    state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
+    loss_list = []
+    for itr in range(1, params.get("no_epochs") + 1):
+        action, eps_threshold = select_action(state, params, env, itr, ode_net=ode_net)
+
+        observation, reward, terminated, truncated, _ = env.step(action.numpy())
+        reward = torch.tensor([reward], device=device)
+        done = terminated or truncated
+
+        if terminated:
+            next_state = None
+        else:
+            next_state = torch.tensor(observation, dtype=torch.float32, device=device)
+
+        replay_memory.push(state, action, next_state, reward)
+        state = next_state
+
+        if len(replay_memory) > params.get("batch_size"):
+            transitions = replay_memory.sample(params.get("batch_size"))
+            batch = Transition(*zip(*transitions))
+
+            state_action_values = []
+            for state in batch.state:
+                state_action_values.append(get_action_from_ode_net(ode_net, state, params))
+
+            expected_state_action_values = []
+            for next_state, reward in zip(batch.next_state, batch.reward):
+                if next_state is not None:
+                    next_state_value = get_action_from_ode_net(ode_net, next_state, params)
+                    expected_state_action_values.append((next_state_value * params.get("gamma")) + reward)
+                else:
+                    expected_state_action_values.append(reward)
+
+            state_action_values = torch.tensor(state_action_values, requires_grad=True)
+            expected_state_action_values = torch.tensor(expected_state_action_values, requires_grad=True)
+
+            criterion = torch.nn.SmoothL1Loss()
+            loss = criterion(state_action_values, expected_state_action_values)
+
+            optimizer.zero_grad()
+
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(ode_net.parameters(), 100)
+            optimizer.step()
+            print(f"{itr}: {loss.item()} esp: {eps_threshold}")
+            loss_list.append(loss.item())
+
+        if itr % 500 == 0:
+            policy = odeint(ode_net, torch.tensor([-1, -1.2, -0.07]), torch.linspace(-1, 1, 100))
+            transitions = replay_memory.get_memory()
+            full_batch = Transition(*zip(*transitions))
+
+            with torch.no_grad():
+                ax = plt.figure(1).add_subplot(projection='3d')
+                ax.scatter(policy[:, 0].numpy(), policy[:, 1].numpy(), policy[:, 2].numpy(),
+                           cmap=matplotlib.cm.coolwarm, label="policy")
+                ax.scatter(torch.tensor(full_batch.action).numpy(),
+                           torch.cat(full_batch.state, 1).numpy()[0],
+                           torch.cat(full_batch.state, 1).numpy()[1],
+                           cmap=matplotlib.cm.coolwarm, label="true")
+                plt.legend()
+                plt.title(itr)
+                plt.draw()
+
+            if itr != params.get("no_epchs"):
+                plt.pause(0.0001)
+                plt.clf()
+            else:
+                plt.savefig("training_progress.png")
+
+                plt.figure(1)
+                plt.plot(loss_list)
+                plt.savefig("training_loss.png")
+
