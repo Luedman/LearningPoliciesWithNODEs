@@ -79,10 +79,9 @@ def get_action_from_ode_net(ode_net, state, params):
 
 
 def select_action(state, params, env, steps_done, policy_net=None, ode_net=None):
-    eps_threshold = params.get("eps_end") + (params.get("eps_start") - params.get("eps_end")) * math.exp(
-        -1. * steps_done / params.get("eps_decay"))
-    if steps_done % 1000 == 0 and False:
-        print(f"eps: {eps_threshold} steps: {steps_done}")
+    eps_threshold = params.get("eps_end") + (params.get("eps_start") - params.get("eps_end")) * \
+                    math.exp(-1. * steps_done / params.get("eps_decay"))
+    """print(f"eps: {eps_threshold} steps: {steps_done}")"""
     steps_done += 1
     with torch.no_grad():
         rand = random.random()
@@ -90,6 +89,7 @@ def select_action(state, params, env, steps_done, policy_net=None, ode_net=None)
             action = policy_net(state).max(1)[1].view(1, 1)
         elif rand > eps_threshold and ode_net is not None:
             action = get_action_from_ode_net(ode_net, state, params)
+            """policy[torch.abs(policy[:, 1:3] - torch.flatten(state)).argmin()][0]"""
         else:
             action = torch.tensor(env.action_space.sample().reshape(1, 1, 1, ),
                                   device=params.get("device"),
@@ -103,7 +103,7 @@ def plot_durations(episode_epsilon_end, episode_training_error, episode_duration
     plt.figure(1)
     plt.clf()
     plt.subplot(121)
-    plt.title('Lenght of an episode')
+    plt.title('Length of an episode')
     plt.xlabel('Episode')
     plt.ylabel('Duration')
     plt.plot(durations.numpy())
@@ -324,20 +324,24 @@ def runNeuralODE_gym(env, replay_memory, params):
     state, info = env.reset()
     state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
     loss_list = []
-    for itr in range(1, params.get("no_epochs") + 1):
-        action, eps_threshold = select_action(state, params, env, itr, ode_net=ode_net)
+    for epoch in range(1, params.get("no_epochs") + 1):
+        for steps in range(50):
+            action, eps_threshold = select_action(state, params, env, epoch, ode_net=ode_net)
 
-        observation, reward, terminated, truncated, _ = env.step(action.numpy())
-        reward = torch.tensor([reward], device=device)
-        done = terminated or truncated
+            observation, reward, terminated, truncated, _ = env.step(action.numpy())
+            reward = torch.tensor([reward], device=device)
+            done = terminated or truncated
 
-        if terminated:
-            next_state = None
-        else:
-            next_state = torch.tensor(observation, dtype=torch.float32, device=device)
+            if done:
+                next_state = None
+            else:
+                next_state = torch.tensor(observation, dtype=torch.float32, device=device)
 
-        replay_memory.push(state, action, next_state, reward)
-        state = next_state
+            replay_memory.push(state, action, next_state, reward)
+            state = next_state
+
+            if state is None:
+                break
 
         if len(replay_memory) > params.get("batch_size"):
             transitions = replay_memory.sample(params.get("batch_size"))
@@ -366,10 +370,10 @@ def runNeuralODE_gym(env, replay_memory, params):
             loss.backward()
             torch.nn.utils.clip_grad_value_(ode_net.parameters(), 100)
             optimizer.step()
-            print(f"{itr}: {loss.item()} esp: {eps_threshold}")
+            print(f"{epoch}: {loss.item()} esp: {eps_threshold}")
             loss_list.append(loss.item())
 
-        if itr % 500 == 0:
+        if epoch % 500 == 0:
             policy = odeint(ode_net, torch.tensor([-1, -1.2, -0.07]), torch.linspace(-1, 1, 100))
             transitions = replay_memory.get_memory()
             full_batch = Transition(*zip(*transitions))
@@ -383,10 +387,10 @@ def runNeuralODE_gym(env, replay_memory, params):
                            torch.cat(full_batch.state, 1).numpy()[1],
                            cmap=matplotlib.cm.coolwarm, label="true")
                 plt.legend()
-                plt.title(itr)
+                plt.title(epoch)
                 plt.draw()
 
-            if itr != params.get("no_epchs"):
+            if epoch != params.get("no_epchs"):
                 plt.pause(0.0001)
                 plt.clf()
             else:

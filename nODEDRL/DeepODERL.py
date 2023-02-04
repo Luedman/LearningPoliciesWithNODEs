@@ -22,7 +22,7 @@ hyper_parameter = {
     "tau": 0.005,
     "eps_start": 0.99,
     "eps_end": 0.05,
-    "eps_decay": 2500,
+    "eps_decay": 2_500,
     "learning_rate": 1e-4,
     "no_epochs": 20_000,
     "batch_size": 8,
