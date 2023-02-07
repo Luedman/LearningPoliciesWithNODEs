@@ -67,14 +67,12 @@ class ODENet(torch.nn.Module):
 
 
 def get_action_from_ode_net(ode_net, state, params):
+    # dy/dt = func(t, y), y(t[0]) = y0
+    # da/ds = func(s, a), a(s[0]) = a0
+    # ds/da = func(a, s), s(a[0]) = s0
     with torch.no_grad():
-        policy = odeint(ode_net, torch.tensor([-1, -1.2, -0.07]), torch.linspace(-1, 1, 100))
-        idx_1 = (torch.abs(policy[:, 1] - torch.flatten(state)[0])).argmin()
-        idx_2 = (torch.abs(policy[:, 2] - torch.flatten(state)[1])).argmin()
-        action_1 = policy[idx_1][0]
-        action_2 = policy[idx_2][0]
-        action = torch.mean(torch.tensor([action_1, action_2], device=params.get("device")))
-        action = torch.reshape(action, (1,))
+        policy = odeint(ode_net, torch.cat([state[:, 0, 0], torch.tensor([0])]), torch.linspace(-1, 1, 100))
+        action = torch.reshape(policy[:, 2].argmax() / params.get("no_discretization_points"), (1,))
     return action
 
 
@@ -259,7 +257,7 @@ def runNeuralODE(x_axis_time, y_axis, z_axis, params):
         torch.nn.utils.clip_grad_value_(model.parameters(), 1)
         optimizer.step()
 
-        if itr % 500 == 0:
+        if itr % 10 == 0:
 
             y_pred = odeint(model, y0_batch[0], x_axis_time)
             loss_list.append(loss.item())
@@ -307,62 +305,68 @@ def runNeuralODE(x_axis_time, y_axis, z_axis, params):
 
 
 def runNeuralODE_gym(env, replay_memory, params):
-    steps_done = 0
-    episode_durations = []
-    episode_epsilon_end = []
-    episode_training_error = []
     device = params.get("device")
 
-    plt.ion()
+    # plt.ion()
     no_dims = 3
-
-    loss_list = []
+    no_dp = params.get("no_discretization_points")
 
     ode_net = ODENet(no_dims)
     optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
+    prev_state_values = torch.zeros((no_dp, no_dims))
 
-    state, info = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
-    loss_list = []
+    loss_list, reward_list = [], []
     for epoch in range(1, params.get("no_epochs") + 1):
-        for steps in range(50):
+        state, info = env.reset()
+        state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
+        reward_total_per_epoch = 0
+        steps = 0
+        done = False
+        while not done:
             action, eps_threshold = select_action(state, params, env, epoch, ode_net=ode_net)
+            for i in range(1):
+                observation, reward, terminated, truncated, _ = env.step(action.numpy())
+                done = (terminated or truncated)
+                reward_total_per_epoch += reward
+                reward = torch.tensor([reward], device=device)
 
-            observation, reward, terminated, truncated, _ = env.step(action.numpy())
-            reward = torch.tensor([reward], device=device)
-            done = terminated or truncated
+                if done:
+                    print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
+                          f" reward {reward_total_per_epoch:.2f}")
+                    steps = 0
+                    next_state = None
+                    reward_list.append(reward_total_per_epoch)
+                    break
+                else:
+                    next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=device), (2, 1, 1))
+                    steps += 1
 
-            if done:
-                next_state = None
-            else:
-                next_state = torch.tensor(observation, dtype=torch.float32, device=device)
-
-            replay_memory.push(state, action, next_state, reward)
-            state = next_state
-
-            if state is None:
-                break
+                replay_memory.push(state, action, next_state, reward)
+                state = next_state
 
         if len(replay_memory) > params.get("batch_size"):
             transitions = replay_memory.sample(params.get("batch_size"))
             batch = Transition(*zip(*transitions))
 
             state_action_values = []
-            for state in batch.state:
-                state_action_values.append(get_action_from_ode_net(ode_net, state, params))
+            for state, reward, action in zip(batch.state, batch.reward, batch.action):
+                state_values = odeint(ode_net, torch.cat([state[:, 0, 0], reward]), torch.linspace(-1, 1, 100))
+                q_value = state_values[int(action.flatten()[0] * no_dp)][2][None]
+                state_action_values.append(q_value)
 
             expected_state_action_values = []
             for next_state, reward in zip(batch.next_state, batch.reward):
                 if next_state is not None:
-                    next_state_value = get_action_from_ode_net(ode_net, next_state, params)
-                    expected_state_action_values.append((next_state_value * params.get("gamma")) + reward)
+                    state_values = odeint(ode_net, torch.cat([next_state[:, 0, 0], reward]), torch.linspace(-1, 1, 100))
+                    q_value_next_state = state_values[:, 2].max()[None]
+                    expected_state_action_values.append((q_value_next_state * params.get("gamma")) + reward)
                 else:
                     expected_state_action_values.append(reward)
 
-            state_action_values = torch.tensor(state_action_values, requires_grad=True)
-            expected_state_action_values = torch.tensor(expected_state_action_values, requires_grad=True)
+            state_action_values = torch.cat(state_action_values)
+            expected_state_action_values = torch.cat(expected_state_action_values)
 
-            criterion = torch.nn.SmoothL1Loss()
+            criterion = torch.nn.MSELoss()
             loss = criterion(state_action_values, expected_state_action_values)
 
             optimizer.zero_grad()
@@ -370,33 +374,40 @@ def runNeuralODE_gym(env, replay_memory, params):
             loss.backward()
             torch.nn.utils.clip_grad_value_(ode_net.parameters(), 100)
             optimizer.step()
-            print(f"{epoch}: {loss.item()} esp: {eps_threshold}")
+
             loss_list.append(loss.item())
 
-        if epoch % 500 == 0:
-            policy = odeint(ode_net, torch.tensor([-1, -1.2, -0.07]), torch.linspace(-1, 1, 100))
+        if epoch % 10 == 0:
+            print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
+            state_values = odeint(ode_net, torch.tensor([-1, -1.2, 0]), torch.linspace(-1, 1, 100))
             transitions = replay_memory.get_memory()
             full_batch = Transition(*zip(*transitions))
 
             with torch.no_grad():
                 ax = plt.figure(1).add_subplot(projection='3d')
-                ax.scatter(policy[:, 0].numpy(), policy[:, 1].numpy(), policy[:, 2].numpy(),
-                           cmap=matplotlib.cm.coolwarm, label="policy")
+                #ax.scatter(state_values[:, 0].numpy(), state_values[:, 1].numpy(), state_values[:, 2].numpy(),
+                #           cmap=matplotlib.cm.coolwarm, label="policy")
+                #ax.scatter(prev_state_values[:, 0].numpy(), prev_state_values[:, 1].numpy(),
+                #           prev_state_values[:, 2].numpy(),
+                #           cmap=matplotlib.cm.coolwarm, label="prev policy")
                 ax.scatter(torch.tensor(full_batch.action).numpy(),
                            torch.cat(full_batch.state, 1).numpy()[0],
                            torch.cat(full_batch.state, 1).numpy()[1],
                            cmap=matplotlib.cm.coolwarm, label="true")
+                ax.set_xlabel("action")
+                ax.set_ylabel("state 1: position")
+                ax.set_zlabel("state 2: velocity")
                 plt.legend()
                 plt.title(epoch)
-                plt.draw()
+                prev_state_values = state_values
 
-            if epoch != params.get("no_epchs"):
+            if epoch != params.get("no_epchs") and False:
                 plt.pause(0.0001)
-                plt.clf()
-            else:
-                plt.savefig("training_progress.png")
 
-                plt.figure(1)
-                plt.plot(loss_list)
-                plt.savefig("training_loss.png")
+            plt.savefig("training_progress.png")
+            plt.clf()
 
+            plt.figure(1)
+            plt.plot(loss_list)
+            plt.savefig("training_loss.png")
+            plt.clf()
