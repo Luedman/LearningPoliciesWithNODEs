@@ -23,7 +23,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 hyper_parameter = {
     "gamma": 0.99,
     "tau": 0.005,
-    "eps_start": 0.99,
+    "eps_start": 0.95,
     "eps_end": 0.05,
     "eps_decay": 250,
     "learning_rate": 1e-4,
@@ -32,7 +32,12 @@ hyper_parameter = {
     "period_length": 50,
     "device": device,
     "step_size": 1,
-    "no_discretization_points": 100,
+    "no_sdpoints": 100,
+    "no_adpoints": 10,
+    "observations_low": observations_low,
+    "observations_high": observations_high,
+    "action_low": action_low,
+    "action_high": action_high
 }
 
 # policy_net = DQN(n_observations, n_actions).to(device)
