@@ -2,14 +2,15 @@ import random
 
 import gym
 import torch
-from pip._internal import main as pip
-
-#pip(['install', 'gym[classic_control]'])
 
 from modules import runNeuralODE_gym, ReplayMemory
 
 torch.manual_seed(0)
 random.seed(0)
+
+from matplotlib import rcParams
+
+rcParams.update({'figure.autolayout': True})
 
 env = gym.make('MountainCarContinuous-v0')
 
@@ -19,6 +20,7 @@ observations_low, observations_high = env.observation_space.low, env.observation
 action_low, action_high = env.action_space.low, env.action_space.high
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 hyper_parameter = {
     "gamma": 0.99,

@@ -1,5 +1,6 @@
 import math
 import random
+import time
 from collections import namedtuple, deque
 
 import matplotlib
@@ -44,29 +45,31 @@ class DQN(torch.nn.Module):
 
 
 class EmbeddedModel(torch.nn.Module):
-    def __init__(self, n_observations, n_actions):
+    def __init__(self, n_observations, n_actions, device):
         super(EmbeddedModel, self).__init__()
         self.n_observation = n_observations
         self.n_actions = n_actions
-        self.ode_module = ODENet(n_observations, n_actions)
+        self.ode_module = ODENet(n_observations, device)
+        self.device = device
 
-        self.linear_out = torch.nn.Linear(n_observations, n_actions)
+        self.linear_out = torch.nn.Linear(n_observations, n_actions, device=device)
 
     def forward(self, state):
-        inner_state = odeint(self.ode_module, state.flatten()[:, None].T, torch.linspace(0, 1, 10))
+        inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
+                             torch.linspace(0, 1, 10, device=self.device))
         net_out = self.linear_out(inner_state[-1])
         return net_out
 
 
 class ODENet(torch.nn.Module):
-    def __init__(self, n_observation, n_actions):
+    def __init__(self, n_observation, device):
         super(ODENet, self).__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(n_observation, 100),
+            torch.nn.Linear(n_observation, 100, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(100, 50),
+            torch.nn.Linear(100, 50, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(50, n_observation))
+            torch.nn.Linear(50, n_observation, device=device))
 
         for m in self.net.modules():
             if isinstance(m, torch.nn.Linear):
@@ -98,14 +101,16 @@ def select_action(state, params, env, steps_done, ode_net):
 def get_action_index(action_value, params) -> torch.tensor:
     action_index = torch.bucketize(action_value, torch.linspace(params.get("action_low")[0],
                                                                 params.get("action_high")[0],
-                                                                params.get("no_adpoints")))
+                                                                params.get("no_adpoints"),
+                                                                device=params.get("device")))
     return action_index
 
 
 def get_action_value(action_idx, params) -> torch.tensor:
     action_value = torch.linspace(params.get("action_low")[0],
                                   params.get("action_high")[0],
-                                  params.get("no_adpoints"))[action_idx][None]
+                                  params.get("no_adpoints"),
+                                  device=params.get("device"))[action_idx][None]
 
     return action_value
 
@@ -114,12 +119,14 @@ def runNeuralODE_gym(env, replay_memory, params):
     device = params.get("device")
 
     ode_net = EmbeddedModel(n_observations=len(params.get("observations_high")),
-                            n_actions=params.get("no_adpoints"))
+                            n_actions=params.get("no_adpoints"),
+                            device=device)
     optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
     # prev_state_values = torch.zeros((no_dp, no_dims))
 
     loss_list, reward_list = [], []
     for epoch in range(1, params.get("no_epochs") + 1):
+        start_time = time.time()
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
         reward_total_per_epoch = 0
@@ -129,14 +136,14 @@ def runNeuralODE_gym(env, replay_memory, params):
             action, eps_threshold = select_action(state, params, env, epoch, ode_net=ode_net)
 
             for i in range(5):
-                observation, reward, terminated, truncated, _ = env.step(action.numpy())
+                observation, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 done = (terminated or truncated)
                 reward_total_per_epoch += reward
                 reward = torch.tensor([reward], device=device)
 
                 if done:
                     print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                          f" reward {reward_total_per_epoch:.2f}")
+                          f" reward: {reward_total_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec")
                     steps = 0
                     next_state = None
                     reward_list.append(reward_total_per_epoch)
@@ -181,6 +188,7 @@ def runNeuralODE_gym(env, replay_memory, params):
             optimizer.step()
 
             loss_list.append(loss.item())
+        """print(f"Total Epoch Time {time.time() - start_time:.2f} sec")"""
 
         if epoch % 25 == 0:
             with torch.no_grad():
@@ -199,15 +207,14 @@ def runNeuralODE_gym(env, replay_memory, params):
                 actions = torch.cat(full_batch.action)
 
                 ax = plt.figure(1).add_subplot(projection='3d')
-                ax.scatter(states_0.numpy(), states_1.numpy(), actions.numpy(),
+                ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(), actions.cpu().numpy(),
                            cmap=matplotlib.cm.coolwarm, label="actions played")
-                ax.scatter(states_0.numpy(), states_1.numpy(),
-                           torch.cat(net_actions).numpy(),
+                ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(),
+                           torch.cat(net_actions).cpu().numpy(),
                            cmap=matplotlib.cm.coolwarm, label="net policy")
                 ax.set_xlabel("state 0: position")
                 ax.set_ylabel("state 1: velocity")
                 ax.set_zlabel("action")
-                plt.tight_layout()
                 plt.legend()
                 plt.title(epoch)
                 # prev_state_values = state_values
@@ -221,5 +228,4 @@ def runNeuralODE_gym(env, replay_memory, params):
             plt.figure(1)
             plt.plot(loss_list)
             plt.savefig("training_loss.png")
-            plt.tight_layout()
             plt.clf()
