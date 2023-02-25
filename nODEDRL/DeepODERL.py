@@ -2,6 +2,7 @@ import random
 
 import gym
 import torch
+from gym.spaces import Box, Discrete
 
 from modules import runNeuralODE_gym, ReplayMemory
 
@@ -12,12 +13,16 @@ from matplotlib import rcParams
 
 rcParams.update({'figure.autolayout': True})
 
-env = gym.make('MountainCarContinuous-v0')
+#env = gym.make('MountainCarContinuous-v0')
+env = gym.make('CartPole-v1')
 
 state, info = env.reset()
 
 observations_low, observations_high = env.observation_space.low, env.observation_space.high
-action_low, action_high = env.action_space.low, env.action_space.high
+if type(env.action_space) is Box:
+    action_low, action_high = env.action_space.low, env.action_space.high
+elif type(env.action_space) is Discrete:
+    action_low, action_high = (0, env.action_space.n)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")

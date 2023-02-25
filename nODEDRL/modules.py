@@ -124,29 +124,30 @@ def runNeuralODE_gym(env, replay_memory, params):
     optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
     # prev_state_values = torch.zeros((no_dp, no_dims))
 
-    loss_list, reward_list = [], []
+    loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
     for epoch in range(1, params.get("no_epochs") + 1):
         start_time = time.time()
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
-        reward_total_per_epoch = 0
+        total_reward_per_epoch = 0
         steps = 0
         done = False
         while not done:
             action, eps_threshold = select_action(state, params, env, epoch, ode_net=ode_net)
 
-            for i in range(5):
+            for i in range(1):
                 observation, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 done = (terminated or truncated)
-                reward_total_per_epoch += reward
+                total_reward_per_epoch += reward
                 reward = torch.tensor([reward], device=device)
 
                 if done:
                     print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                          f" reward: {reward_total_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec")
+                          f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec")
                     steps = 0
                     next_state = None
-                    reward_list.append(reward_total_per_epoch)
+                    reward_per_epoch.append(total_reward_per_epoch)
+                    avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
                     break
                 else:
                     next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=device), (2, 1, 1))
@@ -187,10 +188,11 @@ def runNeuralODE_gym(env, replay_memory, params):
             torch.nn.utils.clip_grad_value_(ode_net.parameters(), 100)
             optimizer.step()
 
-            loss_list.append(loss.item())
-        """print(f"Total Epoch Time {time.time() - start_time:.2f} sec")"""
+            loss_per_epoch.append(loss.item())
+            avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
+        print(f"Total Epoch Time {time.time() - start_time:.2f} sec")
 
-        if epoch % 25 == 0:
+        if epoch % 5 == 0:
             with torch.no_grad():
                 print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
                 transitions = replay_memory.get_memory()
@@ -225,7 +227,16 @@ def runNeuralODE_gym(env, replay_memory, params):
             plt.savefig("training_progress.png")
             plt.clf()
 
-            plt.figure(1)
-            plt.plot(loss_list)
-            plt.savefig("training_loss.png")
-            plt.clf()
+            fig, (ax1, ax2) = plt.subplots(1, 2)
+            ax1.plot(loss_per_epoch, label="Loss per epoch")
+            ax1.plot(avg_loss, label="20 moving average loss")
+            ax1.set_title("Training Loss")
+            ax1.legend()
+
+            ax2.plot(reward_per_epoch, label="Reward per epoch")
+            ax2.plot(avg_reward, label="20 moving average reward")
+            ax2.set_title("Training Reward")
+            ax2.legend()
+
+            fig.savefig("training_loss.png")
+            fig.clf()
