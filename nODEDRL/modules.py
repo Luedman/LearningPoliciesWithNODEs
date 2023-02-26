@@ -7,6 +7,7 @@ import matplotlib
 import torch
 from matplotlib import pyplot as plt
 from torchdiffeq import odeint
+from torch.utils.tensorboard import SummaryWriter
 
 is_ipython = 'inline' in matplotlib.get_backend()
 
@@ -56,7 +57,7 @@ class EmbeddedModel(torch.nn.Module):
 
     def forward(self, state):
         inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
-                             torch.linspace(0, 1, 10, device=self.device))
+                             torch.linspace(0, 1, 100, device=self.device))
         net_out = self.linear_out(inner_state[-1])
         return net_out
 
@@ -116,13 +117,13 @@ def get_action_value(action_idx, params) -> torch.tensor:
 
 
 def runNeuralODE_gym(env, replay_memory, params):
+    writer = SummaryWriter(log_dir="runs/nODE_100")
     device = params.get("device")
 
     ode_net = EmbeddedModel(n_observations=len(params.get("observations_high")),
                             n_actions=params.get("no_adpoints"),
                             device=device)
     optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
-    # prev_state_values = torch.zeros((no_dp, no_dims))
 
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
     for epoch in range(1, params.get("no_epochs") + 1):
@@ -148,6 +149,8 @@ def runNeuralODE_gym(env, replay_memory, params):
                     next_state = None
                     reward_per_epoch.append(total_reward_per_epoch)
                     avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
+                    writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
+                    writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
                     break
                 else:
                     next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=device), (2, 1, 1))
@@ -190,53 +193,61 @@ def runNeuralODE_gym(env, replay_memory, params):
 
             loss_per_epoch.append(loss.item())
             avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
-        print(f"Total Epoch Time {time.time() - start_time:.2f} sec")
 
-        if epoch % 5 == 0:
-            with torch.no_grad():
-                print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
-                transitions = replay_memory.get_memory()
-                full_batch = Transition(*zip(*transitions))
+            writer.add_scalar('Loss/train', loss.item(), epoch)
+            writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-20:])), epoch)
+        # print(f"Total Epoch Time {time.time() - start_time:.2f} sec")
 
-                net_actions = []
-                for state in full_batch.state:
-                    action_idx = ode_net(state).argmax()
-                    action_value = get_action_value(action_idx, params)
-                    net_actions.append(action_value)
+        if epoch % 25 == 0:
+            print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
+            generate_charts(epoch, replay_memory, ode_net, params,
+                            loss_per_epoch, avg_loss, reward_per_epoch, avg_reward)
 
-                states_0 = torch.cat(full_batch.state, dim=1)[0, :]
-                states_1 = torch.cat(full_batch.state, dim=1)[1, :]
-                actions = torch.cat(full_batch.action)
 
-                ax = plt.figure(1).add_subplot(projection='3d')
-                ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(), actions.cpu().numpy(),
-                           cmap=matplotlib.cm.coolwarm, label="actions played")
-                ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(),
-                           torch.cat(net_actions).cpu().numpy(),
-                           cmap=matplotlib.cm.coolwarm, label="net policy")
-                ax.set_xlabel("state 0: position")
-                ax.set_ylabel("state 1: velocity")
-                ax.set_zlabel("action")
-                plt.legend()
-                plt.title(epoch)
-                # prev_state_values = state_values
+def generate_charts(epoch, replay_memory, ode_net, params,
+                    loss_per_epoch, avg_loss, reward_per_epoch, avg_reward):
+    with torch.no_grad():
+        transitions = replay_memory.get_memory()
+        full_batch = Transition(*zip(*transitions))
 
-            if epoch != params.get("no_epchs") and False:
-                plt.pause(0.0001)
+        net_actions = []
+        for state in full_batch.state:
+            action_idx = ode_net(state).argmax()
+            action_value = get_action_value(action_idx, params)
+            net_actions.append(action_value)
 
-            plt.savefig("training_progress.png")
-            plt.clf()
+        states_0 = torch.cat(full_batch.state, dim=1)[0, :]
+        states_1 = torch.cat(full_batch.state, dim=1)[1, :]
+        actions = torch.cat(full_batch.action)
 
-            fig, (ax1, ax2) = plt.subplots(1, 2)
-            ax1.plot(loss_per_epoch, label="Loss per epoch")
-            ax1.plot(avg_loss, label="20 moving average loss")
-            ax1.set_title("Training Loss")
-            ax1.legend()
+        ax = plt.figure(1).add_subplot(projection='3d')
+        ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(), actions.cpu().numpy(),
+                   cmap=matplotlib.cm.coolwarm, label="actions played")
+        ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(),
+                   torch.cat(net_actions).cpu().numpy(),
+                   cmap=matplotlib.cm.coolwarm, label="net policy")
+        ax.set_xlabel("state 0: position")
+        ax.set_ylabel("state 1: velocity")
+        ax.set_zlabel("action")
+        plt.legend()
+        plt.title(epoch)
 
-            ax2.plot(reward_per_epoch, label="Reward per epoch")
-            ax2.plot(avg_reward, label="20 moving average reward")
-            ax2.set_title("Training Reward")
-            ax2.legend()
+    if epoch != params.get("no_epchs") and False:
+        plt.pause(0.0001)
 
-            fig.savefig("training_loss.png")
-            fig.clf()
+    plt.savefig("training_progress.png")
+    plt.clf()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    ax1.plot(loss_per_epoch, label="Loss per epoch")
+    ax1.plot(avg_loss, label="20 moving average loss")
+    ax1.set_title("Training Loss")
+    ax1.legend()
+
+    ax2.plot(reward_per_epoch, label="Reward per epoch")
+    ax2.plot(avg_reward, label="20 moving average reward")
+    ax2.set_title("Training Reward")
+    ax2.legend()
+
+    fig.savefig("training_loss.png")
+    fig.clf()

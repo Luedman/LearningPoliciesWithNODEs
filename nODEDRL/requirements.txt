@@ -6,3 +6,4 @@ pandas==1.2.4
 gym[classic_control]==0.26.2
 ipython==7.24.1
 torchdiffeq==0.2.3
+tensorboard==2.12.0

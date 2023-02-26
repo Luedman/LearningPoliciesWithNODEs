@@ -13,8 +13,8 @@ from matplotlib import rcParams
 
 rcParams.update({'figure.autolayout': True})
 
-#env = gym.make('MountainCarContinuous-v0')
-env = gym.make('CartPole-v1')
+env = gym.make('MountainCarContinuous-v0')
+#env = gym.make('CartPole-v1')
 
 state, info = env.reset()
 
@@ -34,7 +34,7 @@ hyper_parameter = {
     "eps_end": 0.05,
     "eps_decay": 250,
     "learning_rate": 1e-4,
-    "no_epochs": 1000,
+    "no_epochs": 500,
     "batch_size": 128,
     "period_length": 50,
     "device": device,
