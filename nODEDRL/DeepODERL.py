@@ -4,7 +4,7 @@ import gym
 import torch
 from gym.spaces import Box, Discrete
 
-from modules import runNeuralODE_gym, ReplayMemory
+from modules import run_model, ReplayMemory, DeepQNet, nODEnet
 
 torch.manual_seed(0)
 random.seed(0)
@@ -14,7 +14,7 @@ from matplotlib import rcParams
 rcParams.update({'figure.autolayout': True})
 
 env = gym.make('MountainCarContinuous-v0')
-#env = gym.make('CartPole-v1')
+# env = gym.make('CartPole-v1')
 
 state, info = env.reset()
 
@@ -32,9 +32,9 @@ hyper_parameter = {
     "tau": 0.005,
     "eps_start": 0.95,
     "eps_end": 0.05,
-    "eps_decay": 250,
+    "eps_decay": 2000,
     "learning_rate": 1e-4,
-    "no_epochs": 500,
+    "no_epochs": 2000,
     "batch_size": 128,
     "period_length": 50,
     "device": device,
@@ -58,6 +58,11 @@ y_axis = torch.linspace(-1, 1, 100, requires_grad=True).to(device) ** 3
 z_axis = torch.sin(y_axis)
 
 replay_memory = ReplayMemory(500)
-runNeuralODE_gym(env, replay_memory, hyper_parameter)
+
+for model_class in [DeepQNet, nODEnet]:
+    model = model_class(n_observations=len(hyper_parameter.get("observations_high")),
+                        n_actions=hyper_parameter.get("no_adpoints"),
+                        device=device)
+    run_model(env, model, replay_memory, hyper_parameter, "a10_r5_dc2000")
 
 # runNeuralODE(x_axis_time, y_axis, z_axis, hyper_parameter)

@@ -6,8 +6,8 @@ from collections import namedtuple, deque
 import matplotlib
 import torch
 from matplotlib import pyplot as plt
-from torchdiffeq import odeint
 from torch.utils.tensorboard import SummaryWriter
+from torchdiffeq import odeint
 
 is_ipython = 'inline' in matplotlib.get_backend()
 
@@ -31,29 +31,31 @@ class ReplayMemory:
         return self._memory
 
 
-class DQN(torch.nn.Module):
-    def __init__(self, n_observation, n_actions):
-        super(DQN, self).__init__()
-        self.layer1 = torch.nn.Linear(n_observation, 128)
-        self.layer2 = torch.nn.Linear(128, 128)
-        self.layer3 = torch.nn.Linear(128, n_actions)
+class DeepQNet(torch.nn.Module):
+    def __init__(self, n_observations, n_actions, device):
+        super(DeepQNet, self).__init__()
+        self.layer1 = torch.nn.Linear(n_observations, 32, device=device)
+        self.layer2 = torch.nn.Linear(32, 32, device=device)
+        self.layer3 = torch.nn.Linear(32, n_actions, device=device)
+        self.model_type = "DeepQNet"
 
     def forward(self, x):
-        x = torch.nn.functional.relu(self.layer1(x))
+        x = torch.nn.functional.relu(self.layer1(x.T))
         x = torch.nn.functional.relu(self.layer2(x))
         x = torch.nn.functional.relu(self.layer3(x))
         return x
 
 
-class EmbeddedModel(torch.nn.Module):
-    def __init__(self, n_observations, n_actions, device):
-        super(EmbeddedModel, self).__init__()
+class nODEnet(torch.nn.Module):
+    def __init__(self, n_observations, n_actions, device, label=None):
+        super(nODEnet, self).__init__()
         self.n_observation = n_observations
         self.n_actions = n_actions
-        self.ode_module = ODENet(n_observations, device)
+        self.ode_module = nODEUnit(n_observations, device)
         self.device = device
 
         self.linear_out = torch.nn.Linear(n_observations, n_actions, device=device)
+        self.model_type = "nODE"
 
     def forward(self, state):
         inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
@@ -62,15 +64,15 @@ class EmbeddedModel(torch.nn.Module):
         return net_out
 
 
-class ODENet(torch.nn.Module):
+class nODEUnit(torch.nn.Module):
     def __init__(self, n_observation, device):
-        super(ODENet, self).__init__()
+        super(nODEUnit, self).__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(n_observation, 100, device=device),
+            torch.nn.Linear(n_observation, 32, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(100, 50, device=device),
+            torch.nn.Linear(32, 32, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(50, n_observation, device=device))
+            torch.nn.Linear(32, n_observation, device=device))
 
         for m in self.net.modules():
             if isinstance(m, torch.nn.Linear):
@@ -82,18 +84,17 @@ class ODENet(torch.nn.Module):
         return net_output
 
 
-def select_action(state, params, env, steps_done, ode_net):
+def select_action(state, params, env, epoch, model):
     eps_threshold = params.get("eps_end") + (params.get("eps_start") - params.get("eps_end")) * \
-                    math.exp(-1. * steps_done / params.get("eps_decay"))
-    steps_done += 1
+                    math.exp(-1. * epoch / params.get("eps_decay"))
     with torch.no_grad():
         rand = random.random()
-        if rand > eps_threshold and ode_net is not None:
-            action_values = ode_net(state)
+        if rand > eps_threshold and model is not None:
+            action_values = model(state)
             action_idx = action_values.argmax()
             action_value = get_action_value(action_idx, params)
         else:
-            action_value = torch.tensor(env.action_space.sample().reshape(1, ),
+            action_value = torch.tensor(env.action_space.sample().reshape(1,),
                                         device=params.get("device"),
                                         dtype=torch.float)
     return action_value, eps_threshold
@@ -112,20 +113,17 @@ def get_action_value(action_idx, params) -> torch.tensor:
                                   params.get("action_high")[0],
                                   params.get("no_adpoints"),
                                   device=params.get("device"))[action_idx][None]
-
     return action_value
 
 
-def runNeuralODE_gym(env, replay_memory, params):
-    writer = SummaryWriter(log_dir="runs/nODE_100")
+def run_model(env, model, replay_memory, params, run_label):
+    writer = SummaryWriter(log_dir=f"runs/{model.model_type}_{run_label}")
     device = params.get("device")
 
-    ode_net = EmbeddedModel(n_observations=len(params.get("observations_high")),
-                            n_actions=params.get("no_adpoints"),
-                            device=device)
-    optimizer = torch.optim.RMSprop(ode_net.parameters(), lr=1e-4)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=params.get("learning_rate"))
 
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
+    no_solves = 0
     for epoch in range(1, params.get("no_epochs") + 1):
         start_time = time.time()
         state, info = env.reset()
@@ -134,23 +132,27 @@ def runNeuralODE_gym(env, replay_memory, params):
         steps = 0
         done = False
         while not done:
-            action, eps_threshold = select_action(state, params, env, epoch, ode_net=ode_net)
+            action, eps_threshold = select_action(state, params, env, epoch, model=model)
 
             for i in range(1):
                 observation, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 done = (terminated or truncated)
+
                 total_reward_per_epoch += reward
                 reward = torch.tensor([reward], device=device)
 
                 if done:
                     print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
                           f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec")
+                    no_solves += int(terminated)
                     steps = 0
                     next_state = None
                     reward_per_epoch.append(total_reward_per_epoch)
                     avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
                     writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
                     writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
+                    writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
+                    writer.add_scalar('No. Solves',no_solves, epoch)
                     break
                 else:
                     next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=device), (2, 1, 1))
@@ -165,7 +167,7 @@ def runNeuralODE_gym(env, replay_memory, params):
 
             state_action_values = []
             for state, reward, action in zip(batch.state, batch.reward, batch.action):
-                action_values = ode_net(state)
+                action_values = model(state)
                 action_idx = get_action_index(action, params)
                 q_value = action_values.flatten()[action_idx]
                 state_action_values.append(q_value)
@@ -173,7 +175,7 @@ def runNeuralODE_gym(env, replay_memory, params):
             expected_state_action_values = []
             for next_state, reward in zip(batch.next_state, batch.reward):
                 if next_state is not None:
-                    exp_action_values = ode_net(next_state)
+                    exp_action_values = model(next_state)
                     exp_q_value_next_state = exp_action_values.max()
                     expected_state_action_values.append((exp_q_value_next_state * params.get("gamma")) + reward)
                 else:
@@ -188,7 +190,7 @@ def runNeuralODE_gym(env, replay_memory, params):
             optimizer.zero_grad()
 
             loss.backward()
-            torch.nn.utils.clip_grad_value_(ode_net.parameters(), 100)
+            torch.nn.utils.clip_grad_value_(model.parameters(), 100)
             optimizer.step()
 
             loss_per_epoch.append(loss.item())
@@ -200,7 +202,7 @@ def runNeuralODE_gym(env, replay_memory, params):
 
         if epoch % 25 == 0:
             print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
-            generate_charts(epoch, replay_memory, ode_net, params,
+            generate_charts(epoch, replay_memory, model, params,
                             loss_per_epoch, avg_loss, reward_per_epoch, avg_reward)
 
 
@@ -250,4 +252,4 @@ def generate_charts(epoch, replay_memory, ode_net, params,
     ax2.legend()
 
     fig.savefig("training_loss.png")
-    fig.clf()
+    plt.close(fig)

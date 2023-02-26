@@ -7,7 +7,7 @@ from torchdiffeq import odeint
 import numpy as np
 is_ipython = 'inline' in matplotlib.get_backend()
 
-from nODEDRL.modules import Transition, select_action, ODENet
+from nODEDRL.modules import Transition, select_action, nODEUnit
 
 
 def plot_durations(episode_epsilon_end, episode_training_error, episode_durations, show_result=False):
@@ -137,7 +137,7 @@ def runNeuralODE(x_axis_time, y_axis, z_axis, params):
 
     loss_list = []
     y_pred_prev = torch.stack([x_axis_time, y_axis, z_axis], dim=1)
-    model = ODENet(no_dims)
+    model = nODEUnit(no_dims)
     optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-4)
 
     for itr in range(1, params.get("no_epochs") + 1):
