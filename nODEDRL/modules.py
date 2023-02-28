@@ -2,6 +2,8 @@ import math
 import random
 import time
 from collections import namedtuple, deque
+from gym.spaces import Box, Discrete
+from itertools import count
 
 import matplotlib
 import torch
@@ -12,6 +14,74 @@ from torchdiffeq import odeint
 is_ipython = 'inline' in matplotlib.get_backend()
 
 Transition = namedtuple("Transition", ('state', 'action', 'next_state', 'reward'))
+
+
+class HyperParameterWrapper:
+    def __init__(self, env,
+                 action_dpoints: int,
+                 gamma: float,
+                 tau: float,
+                 epsilon_start: float,
+                 epsilon_end: float,
+                 epsilon_decay: int,
+                 learning_rate: float,
+                 no_epochs: int,
+                 batch_size: int,
+                 period_length: int = 1,
+                 device_str: str = None,
+                 label: str = None):
+        self.obs_high = env.observation_space.high
+        self.obs_low = env.observation_space.low
+        self.action_dpoints = action_dpoints
+        self.gamma = gamma
+        self.tau = tau
+
+        self.eps_start = epsilon_start
+        self.eps_end = epsilon_end
+        self.eps_decay = epsilon_decay
+
+        self.learning_rate = learning_rate
+        self.no_epochs = no_epochs
+        self.batch_size = batch_size
+
+        self.period_length = period_length
+        self.label = f'_{label}' if label is not None else ''
+
+        if device_str is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device_str)
+
+        if type(env.action_space) is Box:
+            self.action_type = "box"
+            self.action_low, self.action_high = env.action_space.low, env.action_space.high
+            self.disc_action_space = torch.linspace(self.action_low[0],
+                                                    self.action_high[0],
+                                                    self.action_dpoints, device=self.device)
+
+        elif type(env.action_space) is Discrete:
+            self.action_type = "discrete"
+            self.action_low, self.action_high = (0, env.action_space.n)
+            self.disc_action_space = list(range(env.action_space.n))
+            self.action_dpoints = env.action_space.n
+
+    @property
+    def short_label(self) -> str:
+        return f"adp{self.action_dpoints}_g{self.gamma}_edc{self.eps_decay}_" \
+               f"pl{self.period_length}" + self.label
+
+    def conv_action(self, action):
+        if self.action_type == "box":
+            return action.cpu().numpy()
+        elif self.action_type == "discrete":
+            return int(action)
+
+    def get_action_index(self, action_value) -> torch.tensor:
+        if self.action_type == "box":
+            action_index = torch.bucketize(action_value, self.disc_action_space)
+        elif self.action_type == "discrete":
+            action_index = torch.bucketize(action_value, torch.tensor(self.disc_action_space, device=self.device))
+        return action_index
 
 
 class ReplayMemory:
@@ -31,16 +101,18 @@ class ReplayMemory:
         return self._memory
 
 
+
+
 class DeepQNet(torch.nn.Module):
     def __init__(self, n_observations, n_actions, device):
         super(DeepQNet, self).__init__()
-        self.layer1 = torch.nn.Linear(n_observations, 32, device=device)
-        self.layer2 = torch.nn.Linear(32, 32, device=device)
-        self.layer3 = torch.nn.Linear(32, n_actions, device=device)
+        self.layer1 = torch.nn.Linear(n_observations, 128, device=device)
+        self.layer2 = torch.nn.Linear(128, 128, device=device)
+        self.layer3 = torch.nn.Linear(128, n_actions, device=device)
         self.model_type = "DeepQNet"
 
     def forward(self, x):
-        x = torch.nn.functional.relu(self.layer1(x.T))
+        x = torch.nn.functional.relu(self.layer1(x))
         x = torch.nn.functional.relu(self.layer2(x))
         x = torch.nn.functional.relu(self.layer3(x))
         return x
@@ -59,7 +131,7 @@ class nODEnet(torch.nn.Module):
 
     def forward(self, state):
         inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
-                             torch.linspace(0, 1, 100, device=self.device))
+                             torch.linspace(0, 1, 10, device=self.device))
         net_out = self.linear_out(inner_state[-1])
         return net_out
 
@@ -68,11 +140,11 @@ class nODEUnit(torch.nn.Module):
     def __init__(self, n_observation, device):
         super(nODEUnit, self).__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(n_observation, 32, device=device),
+            torch.nn.Linear(n_observation, 128, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(32, 32, device=device),
+            torch.nn.Linear(128, 128, device=device),
             torch.nn.Tanh(),
-            torch.nn.Linear(32, n_observation, device=device))
+            torch.nn.Linear(128, n_observation, device=device))
 
         for m in self.net.modules():
             if isinstance(m, torch.nn.Linear):
@@ -84,145 +156,168 @@ class nODEUnit(torch.nn.Module):
         return net_output
 
 
-def select_action(state, params, env, epoch, model):
-    eps_threshold = params.get("eps_end") + (params.get("eps_start") - params.get("eps_end")) * \
-                    math.exp(-1. * epoch / params.get("eps_decay"))
+def select_action(state: torch.tensor,
+                  hp: HyperParameterWrapper,
+                  env,
+                  total_steps: int,
+                  policy_net: torch.nn.Module) -> (torch.tensor, float):
+    eps_threshold = hp.eps_end + (hp.eps_start - hp.eps_end) * \
+                    math.exp(-1. * total_steps / hp.eps_decay)
     with torch.no_grad():
         rand = random.random()
-        if rand > eps_threshold and model is not None:
-            action_values = model(state)
+        if rand > eps_threshold:
+            action_values = policy_net(state.T)
             action_idx = action_values.argmax()
-            action_value = get_action_value(action_idx, params)
+            action_value = hp.disc_action_space[action_idx]
         else:
-            action_value = torch.tensor(env.action_space.sample().reshape(1,),
-                                        device=params.get("device"),
-                                        dtype=torch.float)
-    return action_value, eps_threshold
+            action_value = env.action_space.sample()
+        action_value_tensor = torch.tensor(action_value, device=hp.device, dtype=torch.float).reshape(1, )
+    return action_value_tensor, eps_threshold
 
 
-def get_action_index(action_value, params) -> torch.tensor:
-    action_index = torch.bucketize(action_value, torch.linspace(params.get("action_low")[0],
-                                                                params.get("action_high")[0],
-                                                                params.get("no_adpoints"),
-                                                                device=params.get("device")))
-    return action_index
+def run_model(env,
+              model_class: torch.nn.Module,
+              replay_memory: ReplayMemory,
+              hp: HyperParameterWrapper):
+    policy_net = model_class(n_observations=len(hp.obs_high),
+                             n_actions=hp.action_dpoints,
+                             device=hp.device)
+    target_net = model_class(n_observations=len(hp.obs_high),
+                             n_actions=hp.action_dpoints,
+                             device=hp.device)
 
-
-def get_action_value(action_idx, params) -> torch.tensor:
-    action_value = torch.linspace(params.get("action_low")[0],
-                                  params.get("action_high")[0],
-                                  params.get("no_adpoints"),
-                                  device=params.get("device"))[action_idx][None]
-    return action_value
-
-
-def run_model(env, model, replay_memory, params, run_label):
-    writer = SummaryWriter(log_dir=f"runs/{model.model_type}_{run_label}")
-    device = params.get("device")
-
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=params.get("learning_rate"))
+    writer = SummaryWriter(log_dir=f"runs/{policy_net.model_type}_{hp.short_label}")
+    optimizer = torch.optim.AdamW(policy_net.parameters(), lr=hp.learning_rate, amsgrad=True)
 
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
     no_solves = 0
-    for epoch in range(1, params.get("no_epochs") + 1):
+    total_steps = 0
+    for epoch in range(1, hp.no_epochs + 1):
         start_time = time.time()
         state, info = env.reset()
-        state = torch.tensor(state, dtype=torch.float32, device=device)[:, None, None]
+        state = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
         total_reward_per_epoch = 0
-        steps = 0
         done = False
-        while not done:
-            action, eps_threshold = select_action(state, params, env, epoch, model=model)
+        for steps in count():
+            if done:
+                break
+            action, eps_threshold = select_action(state, hp, env, total_steps, policy_net=policy_net)
+            total_steps += 1
 
-            for i in range(1):
-                observation, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
-                done = (terminated or truncated)
+            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action))
+            done = (terminated or truncated)
 
-                total_reward_per_epoch += reward
-                reward = torch.tensor([reward], device=device)
+            total_reward_per_epoch += reward
+            reward = torch.tensor([reward], device=hp.device)
 
-                if done:
-                    print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                          f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec")
-                    no_solves += int(terminated)
-                    steps = 0
-                    next_state = None
-                    reward_per_epoch.append(total_reward_per_epoch)
-                    avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
-                    writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
-                    writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
-                    writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
-                    writer.add_scalar('No. Solves',no_solves, epoch)
-                    break
-                else:
-                    next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=device), (2, 1, 1))
-                    steps += 1
+            if done:
+                print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
+                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
+                      f" eps: {eps_threshold:.2f}")
+                no_solves += int(terminated)
+                next_state = None
+                reward_per_epoch.append(total_reward_per_epoch)
+                avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
+                writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
+                writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
+                writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
+                writer.add_scalar('No. Solves', no_solves, epoch)
+                writer.add_scalar('Steps', steps, epoch)
+            else:
+                next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=hp.device),
+                                           (len(hp.obs_high), 1, 1))
+                steps += 1
 
-                replay_memory.push(state, action, next_state, reward)
-                state = next_state
+            replay_memory.push(state, action, next_state, reward)
+            state = next_state
 
-        if len(replay_memory) > params.get("batch_size"):
-            transitions = replay_memory.sample(params.get("batch_size"))
-            batch = Transition(*zip(*transitions))
+            if len(replay_memory) > hp.batch_size:
+                loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer)
 
-            state_action_values = []
-            for state, reward, action in zip(batch.state, batch.reward, batch.action):
-                action_values = model(state)
-                action_idx = get_action_index(action, params)
-                q_value = action_values.flatten()[action_idx]
-                state_action_values.append(q_value)
+                loss_per_epoch.append(loss.item())
+                avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
 
-            expected_state_action_values = []
-            for next_state, reward in zip(batch.next_state, batch.reward):
-                if next_state is not None:
-                    exp_action_values = model(next_state)
-                    exp_q_value_next_state = exp_action_values.max()
-                    expected_state_action_values.append((exp_q_value_next_state * params.get("gamma")) + reward)
-                else:
-                    expected_state_action_values.append(reward)
-
-            state_action_values = torch.cat(state_action_values)
-            expected_state_action_values = torch.cat(expected_state_action_values)
-
-            criterion = torch.nn.MSELoss()
-            loss = criterion(state_action_values, expected_state_action_values)
-
-            optimizer.zero_grad()
-
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(model.parameters(), 100)
-            optimizer.step()
-
-            loss_per_epoch.append(loss.item())
-            avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
-
-            writer.add_scalar('Loss/train', loss.item(), epoch)
-            writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-20:])), epoch)
-        # print(f"Total Epoch Time {time.time() - start_time:.2f} sec")
+                writer.add_scalar('Loss/train', loss.item(), total_steps)
+                writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
 
         if epoch % 25 == 0:
-            print(f"E{epoch}: Loss {loss.item():.6f}, Esp: {eps_threshold:.2f}")
-            generate_charts(epoch, replay_memory, model, params,
-                            loss_per_epoch, avg_loss, reward_per_epoch, avg_reward)
+            generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
+                            reward_per_epoch, avg_reward)
 
 
-def generate_charts(epoch, replay_memory, ode_net, params,
-                    loss_per_epoch, avg_loss, reward_per_epoch, avg_reward):
+def optimize_model(replay_memory, hp, policy_net, target_net, optimizer):
+    transitions = replay_memory.sample(hp.batch_size)
+    batch = Transition(*zip(*transitions))
+
+    start_time = time.time()
+
+    state_action_values = []
+    for state, reward, action in zip(batch.state, batch.reward, batch.action):
+        action_values = policy_net(state)
+        action_idx = hp.get_action_index(action)
+        q_value = action_values.flatten()[action_idx]
+        state_action_values.append(q_value)
+
+    expected_state_action_values = []
+    for next_state, reward in zip(batch.next_state, batch.reward):
+        if next_state is not None:
+            exp_action_values = target_net(next_state)
+            exp_q_value_next_state = exp_action_values.max()
+            expected_state_action_values.append((exp_q_value_next_state * hp.gamma) + reward)
+        else:
+            expected_state_action_values.append(reward)
+
+    state_action_values = torch.cat(state_action_values)
+    expected_state_action_values = torch.cat(expected_state_action_values)
+
+    # print(f"{time.time() - start_time:.2f} sec for dataset" )
+    start_time = time.time()
+
+    criterion = torch.nn.SmoothL1Loss()
+    loss = criterion(state_action_values, expected_state_action_values)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+    optimizer.step()
+
+    target_net_state_dict = target_net.state_dict()
+    policy_net_state_dict = policy_net.state_dict()
+
+    for key in policy_net_state_dict:
+        target_net_state_dict[key] = policy_net_state_dict[key] * hp.tau + \
+                                     target_net_state_dict[key] * (1 - hp.tau)
+    target_net.load_state_dict(target_net_state_dict)
+
+    # print(f"{time.time() - start_time:.2f} sec for training")
+
+    return loss, target_net, policy_net
+
+
+def generate_charts(epoch: int,
+                    replay_memory: ReplayMemory,
+                    policy_net: torch.nn.Module,
+                    hp: HyperParameterWrapper,
+                    loss_per_epoch: list,
+                    avg_loss: list,
+                    reward_per_epoch: list,
+                    avg_reward: list):
     with torch.no_grad():
         transitions = replay_memory.get_memory()
         full_batch = Transition(*zip(*transitions))
 
         net_actions = []
         for state in full_batch.state:
-            action_idx = ode_net(state).argmax()
-            action_value = get_action_value(action_idx, params)
-            net_actions.append(action_value)
+            action_idx = policy_net(state).argmax()
+            action_value = hp.disc_action_space[action_idx]
+            net_actions.append(torch.tensor(hp.conv_action(action_value)).reshape(1, ))
 
         states_0 = torch.cat(full_batch.state, dim=1)[0, :]
         states_1 = torch.cat(full_batch.state, dim=1)[1, :]
         actions = torch.cat(full_batch.action)
 
-        ax = plt.figure(1).add_subplot(projection='3d')
+        fig = plt.figure(1)
+        ax = fig.add_subplot(projection='3d')
         ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(), actions.cpu().numpy(),
                    cmap=matplotlib.cm.coolwarm, label="actions played")
         ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(),
@@ -234,11 +329,8 @@ def generate_charts(epoch, replay_memory, ode_net, params,
         plt.legend()
         plt.title(epoch)
 
-    if epoch != params.get("no_epchs") and False:
-        plt.pause(0.0001)
-
-    plt.savefig("training_progress.png")
-    plt.clf()
+        plt.savefig("training_progress.png")
+        plt.close(fig)
 
     fig, (ax1, ax2) = plt.subplots(1, 2)
     ax1.plot(loss_per_epoch, label="Loss per epoch")
