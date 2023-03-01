@@ -249,14 +249,8 @@ def optimize_model(replay_memory, hp, policy_net, target_net, optimizer):
     transitions = replay_memory.sample(hp.batch_size)
     batch = Transition(*zip(*transitions))
 
-    start_time = time.time()
-
-    state_action_values = []
-    for state, reward, action in zip(batch.state, batch.reward, batch.action):
-        action_values = policy_net(state)
-        action_idx = hp.get_action_index(action)
-        q_value = action_values.flatten()[action_idx]
-        state_action_values.append(q_value)
+    start_time = time.time()   
+    state_action_values = policy_net(torch.cat(batch.state, dim=1).T)[0].max(1).values
 
     expected_state_action_values = []
     for next_state, reward in zip(batch.next_state, batch.reward):
