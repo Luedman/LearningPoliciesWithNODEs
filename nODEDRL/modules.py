@@ -2,11 +2,11 @@ import math
 import random
 import time
 from collections import namedtuple, deque
-from gym.spaces import Box, Discrete
 from itertools import count
 
 import matplotlib
 import torch
+from gym.spaces import Box, Discrete
 from matplotlib import pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from torchdiffeq import odeint
@@ -58,12 +58,14 @@ class HyperParameterWrapper:
             self.disc_action_space = torch.linspace(self.action_low[0],
                                                     self.action_high[0],
                                                     self.action_dpoints, device=self.device)
+            self.torch_action_type = torch.float
 
         elif type(env.action_space) is Discrete:
             self.action_type = "discrete"
             self.action_low, self.action_high = (0, env.action_space.n)
             self.disc_action_space = list(range(env.action_space.n))
             self.action_dpoints = env.action_space.n
+            self.torch_action_type = torch.int64
 
     @property
     def short_label(self) -> str:
@@ -99,8 +101,6 @@ class ReplayMemory:
 
     def get_memory(self):
         return self._memory
-
-
 
 
 class DeepQNet(torch.nn.Module):
@@ -161,8 +161,9 @@ def select_action(state: torch.tensor,
                   env,
                   total_steps: int,
                   policy_net: torch.nn.Module) -> (torch.tensor, float):
-    eps_threshold = hp.eps_end + (hp.eps_start - hp.eps_end) * \
-                    math.exp(-1. * total_steps / hp.eps_decay)
+    eps_threshold = hp.eps_start
+    # eps_threshold = 1 - (epoch / hp.no_epochs)
+    eps_threshold = hp.eps_end + (hp.eps_start - hp.eps_end) * math.exp(-1. * total_steps / hp.eps_decay)
     with torch.no_grad():
         rand = random.random()
         if rand > eps_threshold:
@@ -171,7 +172,8 @@ def select_action(state: torch.tensor,
             action_value = hp.disc_action_space[action_idx]
         else:
             action_value = env.action_space.sample()
-        action_value_tensor = torch.tensor(action_value, device=hp.device, dtype=torch.float).reshape(1, )
+        action_value_tensor = torch.tensor(action_value, device=hp.device,
+                                           dtype=hp.torch_action_type).reshape(1, )
     return action_value_tensor, eps_threshold
 
 
@@ -192,17 +194,16 @@ def run_model(env,
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
     no_solves = 0
     total_steps = 0
+    action_values = 0
     for epoch in range(1, hp.no_epochs + 1):
         start_time = time.time()
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
         total_reward_per_epoch = 0
-        done = False
         for steps in count():
-            if done:
-                break
             action, eps_threshold = select_action(state, hp, env, total_steps, policy_net=policy_net)
             total_steps += 1
+            action_values += action
 
             observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action))
             done = (terminated or truncated)
@@ -210,19 +211,9 @@ def run_model(env,
             total_reward_per_epoch += reward
             reward = torch.tensor([reward], device=hp.device)
 
-            if done:
-                print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
-                      f" eps: {eps_threshold:.2f}")
-                no_solves += int(terminated)
+            if terminated:
+                no_solves += int(truncated)
                 next_state = None
-                reward_per_epoch.append(total_reward_per_epoch)
-                avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
-                writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
-                writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
-                writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
-                writer.add_scalar('No. Solves', no_solves, epoch)
-                writer.add_scalar('Steps', steps, epoch)
             else:
                 next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=hp.device),
                                            (len(hp.obs_high), 1, 1))
@@ -240,50 +231,66 @@ def run_model(env,
                 writer.add_scalar('Loss/train', loss.item(), total_steps)
                 writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
 
-        if epoch % 25 == 0:
-            generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
-                            reward_per_epoch, avg_reward)
+            if done:
+                reward_per_epoch.append(total_reward_per_epoch)
+                avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
+                writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
+                writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
+                writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
+                writer.add_scalar('No. Solves', no_solves, epoch)
+                writer.add_scalar('Steps', steps, epoch)
+                writer.add_scalar('Avg. Action value', action_values/total_steps, epoch)
+                print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
+                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
+                      f" eps: {eps_threshold:.2f}")
+                break
+
+        if epoch % 100 == 0 and False:
+            target_net_state_dict = target_net.state_dict()
+            policy_net_state_dict = policy_net.state_dict()
+            for key in policy_net_state_dict:
+                target_net_state_dict[key] = policy_net_state_dict[key]
+            target_net.load_state_dict(target_net_state_dict)
+
+            # generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
+            #                reward_per_epoch, avg_reward)
 
 
-def optimize_model(replay_memory, hp, policy_net, target_net, optimizer):
+def optimize_model(replay_memory: ReplayMemory,
+                   hp: HyperParameterWrapper,
+                   policy_net: torch.nn.Module,
+                   target_net: torch.nn.Module,
+                   optimizer: torch.optim):
     transitions = replay_memory.sample(hp.batch_size)
     batch = Transition(*zip(*transitions))
 
-    start_time = time.time()   
-    state_action_values = policy_net(torch.cat(batch.state, dim=1).T)[0].max(1).values
+    state_action_values = policy_net(torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
 
-    expected_state_action_values = []
-    for next_state, reward in zip(batch.next_state, batch.reward):
-        if next_state is not None:
-            exp_action_values = target_net(next_state)
-            exp_q_value_next_state = exp_action_values.max()
-            expected_state_action_values.append((exp_q_value_next_state * hp.gamma) + reward)
-        else:
-            expected_state_action_values.append(reward)
+    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+                                            batch.next_state)), device=hp.device, dtype=torch.bool)
 
-    state_action_values = torch.cat(state_action_values)
-    expected_state_action_values = torch.cat(expected_state_action_values)
+    non_final_next_states = torch.cat([s for s in batch.next_state if s is not None], dim=1)
 
-    # print(f"{time.time() - start_time:.2f} sec for dataset" )
-    start_time = time.time()
+    next_state_values = torch.zeros(hp.batch_size, device=hp.device)
+    with torch.no_grad():
+        next_state_values[non_final_mask] = target_net(non_final_next_states.T)[0].max(1)[0]
+
+    expected_state_action_values = (next_state_values * hp.gamma) + torch.cat(batch.reward)
 
     criterion = torch.nn.SmoothL1Loss()
-    loss = criterion(state_action_values, expected_state_action_values)
+    loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
 
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+    torch.nn.utils.clip_grad_value_(policy_net.parameters(), 1)
     optimizer.step()
 
     target_net_state_dict = target_net.state_dict()
     policy_net_state_dict = policy_net.state_dict()
-
     for key in policy_net_state_dict:
         target_net_state_dict[key] = policy_net_state_dict[key] * hp.tau + \
                                      target_net_state_dict[key] * (1 - hp.tau)
     target_net.load_state_dict(target_net_state_dict)
-
-    # print(f"{time.time() - start_time:.2f} sec for training")
 
     return loss, target_net, policy_net
 
@@ -302,7 +309,7 @@ def generate_charts(epoch: int,
 
         net_actions = []
         for state in full_batch.state:
-            action_idx = policy_net(state).argmax()
+            action_idx = policy_net(state.T).argmax()
             action_value = hp.disc_action_space[action_idx]
             net_actions.append(torch.tensor(hp.conv_action(action_value)).reshape(1, ))
 

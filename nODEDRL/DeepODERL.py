@@ -6,8 +6,8 @@ from gym.spaces import Box, Discrete
 
 from modules import run_model, ReplayMemory, DeepQNet, nODEnet, HyperParameterWrapper
 
-torch.manual_seed(0)
-random.seed(0)
+torch.manual_seed(1)
+random.seed(1)
 
 from matplotlib import rcParams
 
@@ -27,10 +27,10 @@ hp = HyperParameterWrapper(env=env,
                            epsilon_decay=1000,
                            learning_rate=1e-4,
                            no_epochs=2000,
-                           batch_size=32,
-                           device_str="cuda",
+                           batch_size=128,
+                           device_str="cpu",
                            period_length=1,
-                           label="cuda")
+                           label="test_dqn1")
 
 # policy_net = DQN(n_observations, n_actions).to(device)
 # target_net = DQN(n_observations, n_actions).to(device)

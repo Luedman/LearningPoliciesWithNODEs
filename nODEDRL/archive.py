@@ -91,11 +91,13 @@ def run_training(env, replay_memory, target_net, policy_net, params):
     episode_training_error = []
     device = params.get("device")
     optimizer = torch.optim.AdamW(policy_net.parameters(), lr=params.get("learning_rate"), amsgrad=True)
+    action_values = 0
     for i_episode in range(params.get("no_episodes")):
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         for t in count():
             action, eps_threshold = select_action(state, params, env, steps_done, policy_net=policy_net)
+            action_values += action
             observation, reward, terminated, truncated, _ = env.step(action.item())
             reward = torch.tensor([reward], device=device)
             done = terminated or truncated
