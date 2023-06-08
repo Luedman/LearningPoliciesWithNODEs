@@ -14,7 +14,8 @@ from matplotlib import pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
-from torchdiffeq import odeint
+# from torchdiffeq import odeint
+from torchdiffeq import odeint_adjoint as odeint
 from torchrl.data import PrioritizedReplayBuffer, ListStorage
 
 is_ipython = 'inline' in matplotlib.get_backend()
@@ -28,12 +29,12 @@ class HyperParameterWrapper:
                  epsilon_end: float,
                  learning_rate: float,
                  no_epochs: int,
-                 no_dsteps: int = 10,
+                 no_dsteps: int = None,
                  no_nodes: int = 32,
                  epsilon_decay: int = None,
                  learning_mode="off-policy",
                  batch_size: int = 256,
-                 tau: float = 0.01,
+                 tau: float = 0.005,
                  gamma: float = 0.99,
                  period_length: int = 1,
                  device_str: str = None,
@@ -81,7 +82,8 @@ class HyperParameterWrapper:
 
     @property
     def short_label(self) -> str:
-        return f"{str(self.device)}_{self.learning_mode}_{self.no_nodes}_{self.no_dsteps}" + self.label
+        dsteps = "" if self.no_dsteps is None else f"_{self.no_dsteps}"
+        return f"{self.no_nodes}{dsteps}_lr{str(self.learning_rate)}" + self.label
 
     def epsilon_threshold(self, episode) -> float:
         if self.learning_mode == 'eps_decay_log':
@@ -90,12 +92,12 @@ class HyperParameterWrapper:
             eps_threshold = max([self.eps_start - (self.eps_start - self.eps_end) * (episode / self.no_epochs) * 2,
                                  self.eps_end])
         elif self.learning_mode == 'off-policy':
-            if episode / self.no_epochs > 0.9:
+            if episode / self.no_epochs < 0.9:
                 eps_threshold = self.eps_start
             else:
                 eps_threshold = 0.0
         elif self.learning_mode == 'on-policy':
-            if episode / self.no_epochs > 0.9:
+            if episode / self.no_epochs < 0.9:
                 eps_threshold = self.eps_end
             else:
                 eps_threshold = 0.0
@@ -310,9 +312,10 @@ def run_model(env,
                 writer.add_scalar('Avg. Action value', action_values / total_steps, epoch)
                 writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
                 writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
-                print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
-                      f" eps: {eps_threshold:.2f}, loss {loss:.2f}")
+                if epoch % 25 == 0:
+                    print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
+                          f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
+                          f" eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.short_label}")
                 break
 
             # generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
@@ -328,7 +331,7 @@ def optimize_model(replay_memory: ReplayMemory,
     idx_choice, transitions = replay_memory.sample(hp.batch_size)
     batch = Transition(*zip(*transitions))
 
-    state_action_values = policy_net(torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
+    state_action_values =  (torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
 
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
                                             batch.next_state)), device=hp.device, dtype=torch.bool)
