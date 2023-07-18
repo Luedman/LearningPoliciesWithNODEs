@@ -82,8 +82,7 @@ class HyperParameterWrapper:
 
     @property
     def short_label(self) -> str:
-        dsteps = "" if self.no_dsteps is None else f"_{self.no_dsteps}"
-        return f"{self.no_nodes}{dsteps}_lr{str(self.learning_rate)}" + self.label
+        return f"{self.no_nodes}_lr{str(self.learning_rate)}_y{self.gamma}_t{self.tau}" + self.label
 
     def epsilon_threshold(self, episode) -> float:
         if self.learning_mode == 'eps_decay_log':
@@ -165,7 +164,7 @@ class DeepQNet(torch.nn.Module):
     def forward(self, x):
         x = torch.nn.functional.relu(self.layer1(x))
         x = torch.nn.functional.relu(self.layer2(x))
-        x = torch.nn.functional.relu(self.layer3(x))
+        x = self.layer3(x)
         return x
 
 
@@ -223,8 +222,9 @@ def select_action(state: torch.tensor,
             action_value = hp.disc_action_space[action_idx]
         else:
             action_value = env.action_space.sample()
-        action_value_tensor = torch.tensor(action_value, device=hp.device,
-                                           dtype=hp.torch_action_type).reshape(1, )
+        action_value_tensor = torch.tensor(action_value,
+                                           device=hp.device,
+                                           dtype=hp.torch_action_type).reshape(1,)
     return action_value_tensor, eps_threshold
 
 
@@ -280,7 +280,10 @@ def run_model(env,
             elif terminated:
                 next_state = None
             else:
-                next_state = torch.reshape(torch.tensor(observation, dtype=torch.float32, device=hp.device),
+                next_state = torch.reshape(torch.tensor(observation,
+                                                        dtype=torch.float32,
+                                                        device=hp.device,
+                                                        requires_grad=True),
                                            (len(hp.obs_high), 1, 1))
                 steps += 1
 
@@ -320,6 +323,9 @@ def run_model(env,
 
             # generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
             #                reward_per_epoch, avg_reward)
+    torch.save(target_net.state_dict(), 'models/' + hp.short_label + '_target_net.pth')
+    torch.save(policy_net.state_dict(), 'models/' + hp.short_label + '_policy_net.pth')
+    print(f'{hp.short_label} done')
 
 
 def optimize_model(replay_memory: ReplayMemory,
@@ -331,7 +337,7 @@ def optimize_model(replay_memory: ReplayMemory,
     idx_choice, transitions = replay_memory.sample(hp.batch_size)
     batch = Transition(*zip(*transitions))
 
-    state_action_values =  (torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
+    state_action_values = (torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
 
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
                                             batch.next_state)), device=hp.device, dtype=torch.bool)
@@ -352,6 +358,7 @@ def optimize_model(replay_memory: ReplayMemory,
 
     optimizer.zero_grad()
     loss.backward()
+
     torch.nn.utils.clip_grad_value_(policy_net.parameters(), 1)
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 0.5)
     optimizer.step()
