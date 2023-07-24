@@ -4,7 +4,8 @@ import gym
 import torch
 from matplotlib import rcParams
 
-from modules import run_model, nODEnet, HyperParameterWrapper, DeepQNet
+from modules import run_model, HyperParameterWrapper
+from models import nODENet, DeepQNet
 
 torch.manual_seed(1)
 random.seed(1)
@@ -15,10 +16,10 @@ rcParams.update({'figure.autolayout': True})
 env = gym.make('CartPole-v1')
 
 for learning_mode in ['eps_decay_log']:
-    for nodes in [32, 64, 128, 256]:
-        for lr in [0.1, 0.01, 0.001, 1e-4, 1e-5]:
-            for tau in [0.1, 0.01, 0.005, 0.001  ]:
-                state, inf o = env.reset()
+    for nodes in [8]:
+        for lr in [0.1]:
+            for tau in [0.005]:
+                state, info = env.reset()
 
                 hp = HyperParameterWrapper(env=env,
                                            no_nodes=nodes,

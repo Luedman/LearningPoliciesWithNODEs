@@ -96,7 +96,7 @@ def run_training(env, replay_memory, target_net, policy_net, params):
         state, info = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         for t in count():
-            action, eps_threshold = select_action(state, params, env, steps_done, policy_net=policy_net)
+            action, eps_threshold = select_action(env, state, steps_done, policy_net=policy_net, hp=params)
             action_values += action
             observation, reward, terminated, truncated, _ = env.step(action.item())
             reward = torch.tensor([reward], device=device)
