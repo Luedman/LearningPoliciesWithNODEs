@@ -12,34 +12,22 @@ import torch
 from gym.spaces import Box, Discrete
 from matplotlib import pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim import AdamW
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 # from torchdiffeq import odeint
-from nODEDRL.models import nODENet, DeepQNet
+from models import nODENet, DeepQNet
 
 is_ipython = 'inline' in matplotlib.get_backend()
 
 Transition = namedtuple("Transition", ('state', 'action', 'next_state', 'reward'))
 
 
-def load_model(model_label: str):
-    (model_type, n_observations, no_nodes, n_actions, device, _) = model_label.split('_')
-    path = os.path.join(os.getcwd(), "models", model_label)
-    if model_type == "nODE":
-        model = nODENet(int(n_observations), int(n_actions), int(no_nodes), device, 10)
-        model.load_state_dict(torch.load(path))
-    elif model_type == "DeepQNet":
-        model = DeepQNet(int(n_observations), int(n_actions), int(no_nodes), device)
-        model.load_state_dict(torch.load(path))
-    else:
-        raise ValueError("model_type unknown")
-    return model
-
-
 class HyperParameterWrapper:
     def __init__(self, env,
                  epsilon_start: float,
+                 model_class_label: str,
                  epsilon_end: float,
                  learning_rate: float,
                  no_epochs: int,
@@ -54,8 +42,10 @@ class HyperParameterWrapper:
                  device_str: str = None,
                  action_dpoints: int = None,
                  label: str = None):
+        self.model_class_label = model_class_label
         self.obs_high = env.observation_space.high
         self.obs_low = env.observation_space.low
+        self.no_observations = len(self.obs_high)
         self.action_dpoints = action_dpoints
         self.gamma = gamma
         self.tau = tau
@@ -72,7 +62,7 @@ class HyperParameterWrapper:
         self.batch_size = batch_size
 
         self.period_length = period_length
-        self.label = f'_{label}' if label is not None else ''
+        self.label = f'-{label}' if label is not None else ''
 
         if device_str is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,24 +85,28 @@ class HyperParameterWrapper:
             self.torch_action_type = torch.int64
 
     @property
-    def short_label(self) -> str:
-        return f"{self.no_nodes}_lr{str(self.learning_rate)}_y{self.gamma}_t{self.tau}" + self.label
+    def model_label(self) -> str:
+        return f"{self.model_class_label}_{self.no_observations}_{self.no_nodes}_{self.action_dpoints}_{self.device}"
 
-    def epsilon_threshold(self, episode) -> float:
-        if episode is None:
-            eps_threshold = 0.0
+    @property
+    def model_training_label(self) -> str:
+        return self.model_label + f"_lr{str(self.learning_rate)}-y{self.gamma}-t{self.tau}" + self.label
+
+    def epsilon_threshold(self, epoch) -> float:
+        if epoch is None:
+            eps_threshold = 0.5
         elif self.learning_mode == 'eps_decay_log':
-            eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * episode / self.eps_decay)
+            eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * epoch / self.eps_decay)
         elif self.learning_mode == 'eps_decay_linear':
-            eps_threshold = max([self.eps_start - (self.eps_start - self.eps_end) * (episode / self.no_epochs) * 2,
+            eps_threshold = max([self.eps_start - (self.eps_start - self.eps_end) * (epoch / self.no_epochs) * 2,
                                  self.eps_end])
         elif self.learning_mode == 'off-policy':
-            if episode / self.no_epochs < 0.9:
+            if epoch / self.no_epochs < 0.9:
                 eps_threshold = self.eps_start
             else:
                 eps_threshold = 0.0
         elif self.learning_mode == 'on-policy':
-            if episode / self.no_epochs < 0.9:
+            if epoch / self.no_epochs < 0.9:
                 eps_threshold = self.eps_end
             else:
                 eps_threshold = 0.0
@@ -171,7 +165,7 @@ class ReplayMemory(Dataset):
 
 def select_action(env,
                   state: torch.tensor,
-                  epoch: int,
+                  epoch,
                   policy_net: torch.nn.Module,
                   hp: HyperParameterWrapper) -> (torch.tensor, float):
     eps_threshold = hp.epsilon_threshold(epoch)
@@ -189,42 +183,9 @@ def select_action(env,
     return action_value_tensor, eps_threshold
 
 
-def make_tensorboard_writer(model_type: str, short_label: str) -> SummaryWriter:
-    tensorboard_label = f'{model_type}_{short_label}'
-    writer = SummaryWriter(log_dir=f"runs/{tensorboard_label}")
+def make_tensorboard_writer(folder: str, run_label: str) -> SummaryWriter:
+    writer = SummaryWriter(log_dir=f"runs/{folder}/{run_label}")
     return writer
-
-
-def run_environment(policy_net, env, hp, epoch):
-    state_transitions = []
-    action_values = 0
-    state, info = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
-    total_reward_per_epoch = 0
-    for steps in count():
-        action, eps_threshold = select_action(env, state, epoch, policy_net=policy_net, hp=hp)
-        action_values += action
-
-        observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action))
-        done = (terminated or truncated)
-
-        if done:
-            next_state = None
-            break
-        else:
-            next_state = torch.reshape(torch.tensor(observation,
-                                                    dtype=torch.float32,
-                                                    device=hp.device,
-                                                    requires_grad=True),
-                                       (len(hp.obs_high), 1, 1))
-            steps += 1
-
-        total_reward_per_epoch += reward
-        reward = torch.tensor([reward], device=hp.device)
-
-        transition = (state, action, next_state, reward)
-        state_transitions.append(transition)
-        return state_transitions, terminated, truncated, total_reward_per_epoch
 
 
 def training_step(replay_memory, hp, policy_net, target_net, optimizer, scheduler, writer, total_steps):
@@ -247,70 +208,99 @@ def write_tensorboard(writer, epoch, total_reward_per_epoch, eps_threshold,
     return writer
 
 
-def run_model(env,
-              model_class,
-              hp: HyperParameterWrapper):
+def load_model(hp: HyperParameterWrapper) -> torch.nn.Module:
+    model_file_name = hp.model_training_label + "-policy-net.pth"
+    (model_type, n_observations, no_nodes, n_actions, device, _) = model_file_name.split('_')
+    path = os.path.join(os.getcwd(), "models", model_file_name)
+    if model_type == "nODE":
+        model = nODENet(int(n_observations), int(n_actions), int(no_nodes), device, 10)
+        model.load_state_dict(torch.load(path))
+    elif model_type == "DeepQNet":
+        model = DeepQNet(int(n_observations), int(n_actions), int(no_nodes), device)
+        model.load_state_dict(torch.load(path))
+    else:
+        raise ValueError("model_type unknown")
+    return model
+
+
+def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, torch.nn.Module,
+                                              AdamW, ReduceLROnPlateau):
     replay_memory = ReplayMemory(1_000)
 
-    policy_net = model_class(n_observations=len(hp.obs_high),
+    if hp.model_class_label == 'nODENet':
+        model_class = nODENet
+    elif hp.model_class_label == 'DeepQNet':
+        model_class = DeepQNet
+    else:
+        raise ValueError("model_class_label not known")
+
+    policy_net = model_class(n_observations=hp.no_observations,
                              n_actions=hp.action_dpoints,
                              device=hp.device,
                              no_nodes=hp.no_nodes,
                              no_dsteps=hp.no_dsteps)
-    target_net = model_class(n_observations=len(hp.obs_high),
+    target_net = model_class(n_observations=hp.no_observations,
                              n_actions=hp.action_dpoints,
                              device=hp.device,
                              no_nodes=hp.no_nodes,
                              no_dsteps=hp.no_dsteps)
 
-    writer = make_tensorboard_writer(policy_net.model_type, hp.short_label)
-    optimizer = torch.optim.AdamW(policy_net.parameters(), lr=hp.learning_rate, amsgrad=True)
+    optimizer = AdamW(policy_net.parameters(), lr=hp.learning_rate, amsgrad=True)
     scheduler = ReduceLROnPlateau(optimizer, 'min', verbose=True, patience=10_000, min_lr=1e-6,
                                   cooldown=10_000, factor=0.5)
 
+    return replay_memory, policy_net, target_net, optimizer, scheduler
+
+
+def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=None):
+    if run_training:
+        replay_memory, policy_net, target_net, optimizer, scheduler = init_model(hp)
+        writer = make_tensorboard_writer('train', hp.model_training_label)
+    else:
+        replay_memory, policy_net, target_net, optimizer, scheduler = None, load_model(hp), None, None, None
+        writer = make_tensorboard_writer('eval', hp.model_training_label)
+
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
-    no_solves = 0
-    total_steps = 0
-    action_values = 0
-    loss = 0
+    no_solves, total_steps, action_values, loss = 0, 0, 0, 0
     start_time_total = time.time()
     for epoch in range(1, hp.no_epochs + 1):
         start_time = time.time()
 
         state, info = env.reset()
-        state = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
+        state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
         total_reward_per_epoch = 0
         for steps in count():
-            action, eps_threshold = select_action(env, state, epoch, policy_net=policy_net, hp=hp)
+            if run_training:
+                action_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
+            else:
+                action_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
             total_steps += 1
-            action_values += action
+            action_values += action_tensor
 
-            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action))
+            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action_tensor))
             done = (terminated or truncated)
 
             if truncated:
                 no_solves += 1
-                next_state = None
+                next_state_tensor = None
             elif terminated:
-                next_state = None
+                next_state_tensor = None
+                reward = -10
             else:
-                next_state = torch.reshape(torch.tensor(observation,
-                                                        dtype=torch.float32,
-                                                        device=hp.device,
-                                                        requires_grad=True),
-                                           (len(hp.obs_high), 1, 1))
+                observation_tensor = torch.tensor(observation, dtype=torch.float32, device=hp.device,
+                                                  requires_grad=True)
+                next_state_tensor = torch.reshape(observation_tensor, (len(hp.obs_high), 1, 1))
                 steps += 1
 
             total_reward_per_epoch += reward
-            reward = torch.tensor([reward], device=hp.device)
+            reward_tensor = torch.tensor([reward], device=hp.device)
+            if run_training:
+                replay_memory.push(state_tensor, action_tensor, next_state_tensor, reward_tensor)
+            state_tensor = next_state_tensor
 
-            replay_memory.push(state, action, next_state, reward)
-
-            state = next_state
-
-            if len(replay_memory) > hp.batch_size:
-                loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net,
-                                                              optimizer, scheduler)
+            if run_training and len(replay_memory) > hp.batch_size:
+                loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer,
+                                                              scheduler)
 
                 loss_per_epoch.append(loss.item())
                 avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
@@ -320,7 +310,6 @@ def run_model(env,
 
             if done:
                 reward_per_epoch.append(total_reward_per_epoch)
-                avg_reward.append(torch.mean(torch.tensor(reward_per_epoch[-20:])))
                 writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
                 writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
                 writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
@@ -332,18 +321,16 @@ def run_model(env,
                 if epoch % 25 == 0:
                     print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
                           f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
-                          f" eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.short_label}")
+                          f" eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}")
                 break
 
-            # generate_charts(epoch, replay_memory, policy_net, hp, loss_per_epoch, avg_loss,
-            #                reward_per_epoch, avg_reward)
-
-    model_label_tn = f"{target_net.model_label}_target-net.pth"
-    model_label_pn = f"{target_net.model_label}_policy-net.pth"
-    torch.save(target_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_tn))
-    torch.save(policy_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_pn))
-    print(f'{model_label_tn} saved')
-    print(f'{model_label_pn} saved')
+    if run_training:
+        model_label_tn = f"{hp.model_training_label}-target-net.pth"
+        model_label_pn = f"{hp.model_training_label}-policy-net.pth"
+        torch.save(target_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_tn))
+        torch.save(policy_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_pn))
+        print(f'{model_label_tn} saved')
+        print(f'{model_label_pn} saved')
 
 
 def optimize_model(replay_memory: ReplayMemory,
@@ -368,8 +355,8 @@ def optimize_model(replay_memory: ReplayMemory,
 
     expected_state_action_values = ((next_state_values * hp.gamma) + torch.cat(batch.reward)).unsqueeze(1)
 
-    td_error = torch.abs(torch.subtract(expected_state_action_values, state_action_values))
-    replay_memory.update_priorities(idx_choice, td_error)
+    # td_error = torch.abs(torch.subtract(expected_state_action_values, state_action_values))
+    # replay_memory.update_priorities(idx_choice, td_error)
 
     criterion = torch.nn.SmoothL1Loss()
     loss = criterion(state_action_values, expected_state_action_values)
