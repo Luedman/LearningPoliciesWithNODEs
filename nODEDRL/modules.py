@@ -40,7 +40,7 @@ class HyperParameterWrapper:
                  gamma: float = 0.99,
                  period_length: int = 1,
                  device_str: str = 'cpu',
-                 action_dpoints: int = None,
+                 action_dpoints: int = 10,
                  label: str = None):
         self.model_class_label = model_class_label
         self.obs_high = env.observation_space.high
@@ -212,7 +212,7 @@ def load_model(hp: HyperParameterWrapper) -> torch.nn.Module:
     model_file_name = hp.model_training_label + "-policy-net.pth"
     (model_type, n_observations, no_nodes, n_actions, device, _) = model_file_name.split('_')
     path = os.path.join(os.getcwd(), "models", model_file_name)
-    if model_type == "nODE":
+    if model_type == "nODENet":
         model = nODENet(int(n_observations), int(n_actions), int(no_nodes), device, 10)
         model.load_state_dict(torch.load(path))
     elif model_type == "DeepQNet":
