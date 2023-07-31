@@ -15,21 +15,21 @@ rcParams.update({'figure.autolayout': True})
 # env = gym.make('MountainCarContinuous-v0')
 env = gym.make('CartPole-v1')
 
-for learning_mode in ['eps_decay_log']:
-    for nodes in [64, 128, 256]:
-        for lr in [0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.00001, 0.000005, 0.000001]:
-            for tau in [0.01, 0.005, 0.001, 0.0005, 0.00001, 0.000005, 0.000001]:
-                for gamma in [0.99, 0.95, 0.9]:
-                    for batch_size in [32, 64, 128, 254]:
+for learning_mode in ['eps_decay_linear']:
+    for nodes in [32, 64, 128]:
+        for lr in [1e-3, 1e-4, 1e-5, 1e-6]:
+            for tau in [0.01, 0.005, 0.001, 0.0005, 0.0001]:
+                for gamma in [0.999, 0.99, 0.95]:
+                    for batch_size in [128]:
                         state, info = env.reset()
 
                         hp = HyperParameterWrapper(env=env,
-                                                   model_class_label='DeepQNet',
+                                                   model_class_label='nODENet',
                                                    no_nodes=nodes,
                                                    learning_mode=learning_mode,
-                                                   no_dsteps=None,
-                                                   epsilon_start=0.9,
-                                                   epsilon_end=0.05,
+                                                   no_dsteps=10,
+                                                   epsilon_start=1.0,
+                                                   epsilon_end=0.0,
                                                    learning_rate=lr,
                                                    no_epochs=2000,
                                                    gamma=gamma,

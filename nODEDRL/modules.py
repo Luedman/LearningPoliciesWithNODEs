@@ -31,7 +31,7 @@ class HyperParameterWrapper:
                  epsilon_end: float,
                  learning_rate: float,
                  no_epochs: int,
-                 no_dsteps: int = None,
+                 no_dsteps: int = 10,
                  no_nodes: int = 32,
                  epsilon_decay: int = None,
                  learning_mode="off-policy",
@@ -39,7 +39,7 @@ class HyperParameterWrapper:
                  tau: float = 0.005,
                  gamma: float = 0.99,
                  period_length: int = 1,
-                 device_str: str = None,
+                 device_str: str = 'cpu',
                  action_dpoints: int = None,
                  label: str = None):
         self.model_class_label = model_class_label
@@ -94,7 +94,7 @@ class HyperParameterWrapper:
 
     def epsilon_threshold(self, epoch) -> float:
         if epoch is None:
-            eps_threshold = 0.5
+            eps_threshold = 0.05
         elif self.learning_mode == 'eps_decay_log':
             eps_threshold = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * epoch / self.eps_decay)
         elif self.learning_mode == 'eps_decay_linear':
@@ -225,7 +225,7 @@ def load_model(hp: HyperParameterWrapper) -> torch.nn.Module:
 
 def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, torch.nn.Module,
                                               AdamW, ReduceLROnPlateau):
-    replay_memory = ReplayMemory(1_000)
+    replay_memory = ReplayMemory(10_000)
 
     if hp.model_class_label == 'nODENet':
         model_class = nODENet
@@ -285,7 +285,6 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
                 next_state_tensor = None
             elif terminated:
                 next_state_tensor = None
-                reward = -10
             else:
                 observation_tensor = torch.tensor(observation, dtype=torch.float32, device=hp.device,
                                                   requires_grad=True)
@@ -325,6 +324,8 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
                 break
 
     if run_training:
+        if not os.path.exists(os.path.join(os.getcwd(), "models")):
+            os.mkdir(os.path.join(os.getcwd(), "models"))
         model_label_tn = f"{hp.model_training_label}-target-net.pth"
         model_label_pn = f"{hp.model_training_label}-policy-net.pth"
         torch.save(target_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_tn))
@@ -342,7 +343,7 @@ def optimize_model(replay_memory: ReplayMemory,
     idx_choice, transitions = replay_memory.sample(hp.batch_size)
     batch = Transition(*zip(*transitions))
 
-    state_action_values = (torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
+    state_action_values = policy_net(torch.cat(batch.state, dim=1).T)[0].gather(1, torch.cat(batch.action).unsqueeze(1))
 
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
                                             batch.next_state)), device=hp.device, dtype=torch.bool)
@@ -355,8 +356,8 @@ def optimize_model(replay_memory: ReplayMemory,
 
     expected_state_action_values = ((next_state_values * hp.gamma) + torch.cat(batch.reward)).unsqueeze(1)
 
-    # td_error = torch.abs(torch.subtract(expected_state_action_values, state_action_values))
-    # replay_memory.update_priorities(idx_choice, td_error)
+    td_error = torch.abs(torch.subtract(expected_state_action_values, state_action_values))
+    replay_memory.update_priorities(idx_choice, td_error)
 
     criterion = torch.nn.SmoothL1Loss()
     loss = criterion(state_action_values, expected_state_action_values)
