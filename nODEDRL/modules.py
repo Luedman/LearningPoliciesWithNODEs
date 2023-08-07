@@ -11,12 +11,11 @@ import numpy as np
 import torch
 from gym.spaces import Box, Discrete
 from matplotlib import pyplot as plt
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
-# from torchdiffeq import odeint
 from models import nODENet, DeepQNet
 
 is_ipython = 'inline' in matplotlib.get_backend()
@@ -75,7 +74,7 @@ class HyperParameterWrapper:
             self.disc_action_space = torch.linspace(self.action_low[0],
                                                     self.action_high[0],
                                                     self.action_dpoints, device=self.device)
-            self.torch_action_type = torch.float
+            self.torch_action_type = torch.int64
 
         elif type(env.action_space) is Discrete:
             self.action_type = "discrete"
@@ -174,13 +173,15 @@ def select_action(env,
         if rand > eps_threshold:
             action_values = policy_net(state.T)
             action_idx = action_values.argmax()
-            action_value = hp.disc_action_space[action_idx]
+            # action_value = hp.disc_action_space[action_idx]
         else:
-            action_value = env.action_space.sample()
-        action_value_tensor = torch.tensor(action_value,
-                                           device=hp.device,
-                                           dtype=hp.torch_action_type).reshape(1, )
-    return action_value_tensor, eps_threshold
+            # action_value = env.action_space.sample()
+            action_idx = torch.multinomial(torch.ones(len(hp.disc_action_space)), 1)
+        # action_value = hp.disc_action_space[action_idx]
+        action_idx_tensor = torch.tensor(action_idx,
+                                         device=hp.device,
+                                         dtype=torch.int64).reshape(1, )
+    return action_idx_tensor, eps_threshold
 
 
 def make_tensorboard_writer(folder: str, run_label: str) -> SummaryWriter:
@@ -271,13 +272,14 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
         total_reward_per_epoch = 0
         for steps in count():
             if run_training:
-                action_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
+                action_idx_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
             else:
-                action_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
+                action_idx_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
             total_steps += 1
-            action_values += action_tensor
+            action_values += action_idx_tensor
 
-            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action_tensor))
+            action_value = hp.disc_action_space[hp.conv_action(action_idx_tensor)]
+            observation, reward, terminated, truncated, _ = env.step(action_value)
             done = (terminated or truncated)
 
             if truncated:
@@ -294,7 +296,7 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
             total_reward_per_epoch += reward
             reward_tensor = torch.tensor([reward], device=hp.device)
             if run_training:
-                replay_memory.push(state_tensor, action_tensor, next_state_tensor, reward_tensor)
+                replay_memory.push(state_tensor, action_idx_tensor, next_state_tensor, reward_tensor)
             state_tensor = next_state_tensor
 
             if run_training and len(replay_memory) > hp.batch_size:
@@ -317,7 +319,7 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
                 writer.add_scalar('Avg. Action value', action_values / total_steps, epoch)
                 writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
                 writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
-                if epoch % 25 == 0:
+                if epoch % 2 == 0:
                     print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
                           f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
                           f" eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}")
