@@ -27,7 +27,7 @@ for nodes in [32, 64, 128]:
                                    epsilon_start=1.0,
                                    epsilon_end=0.0,
                                    learning_rate=0.0001,
-                                   no_epochs=10,
+                                   no_epochs=100,
                                    gamma=gamma,
                                    device_str="cpu",
                                    batch_size=128,
