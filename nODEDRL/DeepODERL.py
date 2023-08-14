@@ -36,7 +36,7 @@ for model_type in ['nODENet']:
                                    batch_size=128,
                                    tau=0.005,
                                    label='mountain-car',
-                                   action_dpoints=10)
+                                   action_dpoints=3)
 
         run_model(env, hp, run_training=True)
         run_model(env, hp, run_training=False)

@@ -283,9 +283,9 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool):
 
             action_value = hp.disc_action_space[hp.conv_action(action_idx_tensor)]
             observation, reward, terminated, truncated, _ = env.step(action_value)
-            obs_log = np.log(np.abs(observation[1]))
-            reward_adjustment = -100 if obs_log == -float('inf') else obs_log
-            reward += (reward_adjustment/1000)
+            # obs_log = np.log(np.abs(observation[1]))
+            # reward_adjustment = -100 if obs_log == -float('inf') else obs_log
+            # reward += (reward_adjustment/1000)
 
             done = (terminated or truncated)
 
