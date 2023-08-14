@@ -1,3 +1,4 @@
+import logging
 import random
 
 import gym
@@ -5,33 +6,37 @@ import torch
 from matplotlib import rcParams
 
 from modules import run_model, HyperParameterWrapper
-from models import nODENet, DeepQNet
+
+logging.basicConfig(filename='logfile.log', encoding='utf-8', level=logging.DEBUG, filemode='w')
 
 torch.manual_seed(1)
 random.seed(1)
 
 rcParams.update({'figure.autolayout': True})
 
-#env = gym.make('MountainCarContinuous-v0')
-env = gym.make('CartPole-v1')
+env = gym.make('MountainCarContinuous-v0')
+# env = gym.make('CartPole-v1')
 
-for nodes in [32, 64, 128]:
-    for gamma in [0.999, 0.99, 0.95]:
+
+for model_type in ['nODENet']:
+    for nodes in [32, 64, 128]:
         state, info = env.reset()
 
         hp = HyperParameterWrapper(env=env,
-                                   model_class_label='nODENet',
+                                   model_class_label=model_type,
                                    no_nodes=nodes,
                                    learning_mode='eps_decay_linear',
-                                   no_dsteps=10,
+                                   no_dsteps=3,
                                    epsilon_start=1.0,
-                                   epsilon_end=0.0,
+                                   epsilon_end=0.05,
                                    learning_rate=0.0001,
-                                   no_epochs=100,
-                                   gamma=gamma,
+                                   no_epochs=1000,
+                                   gamma=0.9,
                                    device_str="cpu",
                                    batch_size=128,
-                                   tau=0.005)
+                                   tau=0.005,
+                                   label='mountain-car',
+                                   action_dpoints=10)
 
         run_model(env, hp, run_training=True)
         run_model(env, hp, run_training=False)

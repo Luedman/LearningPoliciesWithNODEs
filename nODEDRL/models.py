@@ -1,5 +1,6 @@
 import torch
-from torchdiffeq import odeint
+#from torchdiffeq import odeint
+from torchdiffeq import odeint_adjoint as odeint
 
 
 class nODENet(torch.nn.Module):
@@ -19,7 +20,9 @@ class nODENet(torch.nn.Module):
     def forward(self, state):
         # inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
         #                     torch.linspace(0, 1, 10, device=self.device))
-        inner_state = odeint(self.ode_module, state, torch.linspace(0, 1, self.no_dsteps, device=self.device))
+        inner_state = odeint(self.ode_module, state, torch.linspace(0, 1, self.no_dsteps, device=self.device),
+                             atol=0.1)
+                             #rtol=0.01, atol=0.01)
         net_out = self.linear_out(inner_state[-1])
         return net_out
 

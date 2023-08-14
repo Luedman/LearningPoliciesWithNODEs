@@ -3,8 +3,10 @@ import os
 import random
 import time
 from collections import namedtuple, deque
+from datetime import datetime
 from itertools import count
 from operator import itemgetter
+import logging
 
 import matplotlib
 import numpy as np
@@ -253,7 +255,7 @@ def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, tor
     return replay_memory, policy_net, target_net, optimizer, scheduler
 
 
-def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=None):
+def run_model(env, hp: HyperParameterWrapper, run_training: bool):
     if run_training:
         replay_memory, policy_net, target_net, optimizer, scheduler = init_model(hp)
         writer = make_tensorboard_writer('train', hp.model_training_label)
@@ -262,7 +264,7 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
         writer = make_tensorboard_writer('eval', hp.model_training_label)
 
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
-    no_solves, total_steps, action_values, loss = 0, 0, 0, 0
+    no_solves, total_steps, action_values_cumulated, loss = 0, 0, 0, 0
     start_time_total = time.time()
     for epoch in range(1, hp.no_epochs + 1):
         start_time = time.time()
@@ -271,15 +273,20 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
         state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
         total_reward_per_epoch = 0
         for steps in count():
-            if run_training:
-                action_idx_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
-            else:
-                action_idx_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
+            if hp.label == '-mountain-car' and (steps == 0 or steps % 5 == 0):
+                if run_training:
+                    action_idx_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
+                else:
+                    action_idx_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
             total_steps += 1
-            action_values += action_idx_tensor
+            action_values_cumulated += action_idx_tensor
 
             action_value = hp.disc_action_space[hp.conv_action(action_idx_tensor)]
             observation, reward, terminated, truncated, _ = env.step(action_value)
+            obs_log = np.log(np.abs(observation[1]))
+            reward_adjustment = -100 if obs_log == -float('inf') else obs_log
+            reward += (reward_adjustment/1000)
+
             done = (terminated or truncated)
 
             if truncated:
@@ -316,13 +323,17 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool, model_label=No
                 writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
                 writer.add_scalar('No. Solves', no_solves, epoch)
                 writer.add_scalar('Steps', steps, epoch)
-                writer.add_scalar('Avg. Action value', action_values / total_steps, epoch)
+                writer.add_scalar('Avg. Action value', action_values_cumulated / total_steps, epoch)
                 writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
                 writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
-                if epoch % 2 == 0:
-                    print(f"E{epoch}: Done after {steps} steps, terminated: {terminated}, truncated: {truncated}," +
-                          f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f} sec,"
-                          f" eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}")
+                mode = 'train' if run_training else 'eval'
+                episode_summary = f"{datetime.now().strftime('%H:%M:%S')} {mode} E{epoch}: Done after {steps}" + \
+                                  f" steps, terminated: {terminated}, truncated: {truncated}," + \
+                                  f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f}" + \
+                                  f" sec, eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}"
+                logging.info(episode_summary)
+                if epoch % 25 == 0:
+                    print(episode_summary)
                 break
 
     if run_training:
