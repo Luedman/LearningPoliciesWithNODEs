@@ -76,14 +76,12 @@ class HyperParameterWrapper:
             self.disc_action_space = torch.linspace(self.action_low[0],
                                                     self.action_high[0],
                                                     self.action_dpoints, device=self.device)
-            self.torch_action_type = torch.int64
 
         elif type(env.action_space) is Discrete:
             self.action_type = "discrete"
             self.action_low, self.action_high = (0, env.action_space.n)
             self.disc_action_space = list(range(env.action_space.n))
             self.action_dpoints = env.action_space.n
-            self.torch_action_type = torch.int64
 
     @property
     def model_label(self) -> str:
@@ -164,10 +162,7 @@ class ReplayMemory(Dataset):
         return np.divide(self._probabilities, np.sum(self._probabilities))
 
 
-def select_action(env,
-                  state: torch.tensor,
-                  epoch,
-                  policy_net: torch.nn.Module,
+def select_action(state: torch.tensor, epoch, policy_net: torch.nn.Module,
                   hp: HyperParameterWrapper) -> (torch.tensor, float):
     eps_threshold = hp.epsilon_threshold(epoch)
     with torch.no_grad():
@@ -175,11 +170,8 @@ def select_action(env,
         if rand > eps_threshold:
             action_values = policy_net(state.T)
             action_idx = action_values.argmax()
-            # action_value = hp.disc_action_space[action_idx]
         else:
-            # action_value = env.action_space.sample()
             action_idx = torch.multinomial(torch.ones(len(hp.disc_action_space)), 1)
-        # action_value = hp.disc_action_space[action_idx]
         action_idx_tensor = torch.tensor(action_idx,
                                          device=hp.device,
                                          dtype=torch.int64).reshape(1, )
@@ -207,7 +199,6 @@ def write_tensorboard(writer, epoch, total_reward_per_epoch, eps_threshold,
     writer.add_scalar('Steps', steps, epoch)
     writer.add_scalar('Avg. Action value', action_values / total_steps, epoch)
     writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
-
     return writer
 
 
@@ -226,8 +217,7 @@ def load_model(hp: HyperParameterWrapper) -> torch.nn.Module:
     return model
 
 
-def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, torch.nn.Module,
-                                              AdamW, ReduceLROnPlateau):
+def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, torch.nn.Module, AdamW, ReduceLROnPlateau):
     replay_memory = ReplayMemory(10_000)
 
     if hp.model_class_label == 'nODENet':
@@ -267,77 +257,76 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool):
     no_solves, total_steps, action_values_cumulated, loss = 0, 0, 0, 0
     start_time_total = time.time()
     for epoch in range(1, hp.no_epochs + 1):
-        try:
-            start_time = time.time()
-
-            state, info = env.reset()
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
-            total_reward_per_epoch = 0
-            for steps in count():
-                if (hp.label == '-mountain-car' and (steps == 0 or steps % 5 == 0)) or hp.label == '-balancing-pole':
-                    if run_training:
-                        action_idx_tensor, eps_threshold = select_action(env, state_tensor, epoch, policy_net=policy_net, hp=hp)
-                    else:
-                        action_idx_tensor, eps_threshold = select_action(env, state_tensor, None, policy_net=policy_net, hp=hp)
-                total_steps += 1
-                action_values_cumulated += action_idx_tensor
-
-                action_value = hp.disc_action_space[hp.conv_action(action_idx_tensor)]
-                observation, reward, terminated, truncated, _ = env.step(action_value.cpu())
-                # obs_log = np.log(np.abs(observation[1]))
-                # reward_adjustment = -100 if obs_log == -float('inf') else obs_log
-                # reward += (reward_adjustment/1000)
-
-                done = (terminated or truncated)
-
-                if truncated:
-                    no_solves += 1
-                    next_state_tensor = None
-                elif terminated:
-                    next_state_tensor = None
-                else:
-                    observation_tensor = torch.tensor(observation, dtype=torch.float32, device=hp.device,
-                                                      requires_grad=True)
-                    next_state_tensor = torch.reshape(observation_tensor, (len(hp.obs_high), 1, 1))
-                    steps += 1
-
-                total_reward_per_epoch += reward
-                reward_tensor = torch.tensor([reward], device=hp.device)
+        start_time = time.time()
+        state, info = env.reset()
+        state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
+        total_reward_per_epoch = 0
+        for steps in count():
+            if (hp.label == '-MountainCarContinuous-v0' and (steps == 0 or steps % 5 == 0)) or \
+                    (hp.label == '-CartPole-v1'):
                 if run_training:
-                    replay_memory.push(state_tensor, action_idx_tensor, next_state_tensor, reward_tensor)
-                state_tensor = next_state_tensor
+                    action_idx_tensor, eps_threshold = select_action(state_tensor, epoch,
+                                                                     policy_net=policy_net, hp=hp)
+                else:
+                    action_idx_tensor, eps_threshold = select_action(state_tensor, None,
+                                                                     policy_net=policy_net, hp=hp)
+            total_steps += 1
+            action_values_cumulated += action_idx_tensor
 
-                if run_training and len(replay_memory) > hp.batch_size:
-                    loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer,
-                                                                  scheduler)
+            action_value = hp.disc_action_space[action_idx_tensor]
+            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action_value))
+            # obs_log = np.log(np.abs(observation[1]))
+            # reward_adjustment = -100 if obs_log == -float('inf') else obs_log
+            # reward += (reward_adjustment/1000)
 
-                    loss_per_epoch.append(loss.item())
-                    avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
+            done = (terminated or truncated)
 
-                    writer.add_scalar('Loss/train', loss.item(), total_steps)
-                    writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
+            if truncated:
+                no_solves += 1
+                next_state_tensor = None
+            elif terminated:
+                next_state_tensor = None
+            else:
+                observation_tensor = torch.tensor(observation, dtype=torch.float32, device=hp.device,
+                                                  requires_grad=True)
+                next_state_tensor = torch.reshape(observation_tensor, (len(hp.obs_high), 1, 1))
+                steps += 1
 
-                if done:
-                    reward_per_epoch.append(total_reward_per_epoch)
-                    writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
-                    writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
-                    writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
-                    writer.add_scalar('No. Solves', no_solves, epoch)
-                    writer.add_scalar('Steps', steps, epoch)
-                    writer.add_scalar('Avg. Action value', action_values_cumulated / total_steps, epoch)
-                    writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
-                    writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
-                    mode = 'train' if run_training else 'eval'
-                    episode_summary = f"{datetime.now().strftime('%H:%M:%S')} {mode} E{epoch}: Done after {steps}" + \
-                                      f" steps, terminated: {terminated}, truncated: {truncated}," + \
-                                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f}" + \
-                                      f" sec, eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}"
-                    logging.info(episode_summary)
-                    if epoch % 25 == 0:
-                        print(episode_summary)
-                    break
-        except Exception as e:
-            logging.error(f"{datetime.now().strftime('%H:%M:%S')} {e}")
+            total_reward_per_epoch += reward
+            reward_tensor = torch.tensor([reward], device=hp.device)
+            if run_training:
+                replay_memory.push(state_tensor, action_idx_tensor, next_state_tensor, reward_tensor)
+            state_tensor = next_state_tensor
+
+            if run_training and len(replay_memory) > hp.batch_size:
+                loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer,
+                                                              scheduler)
+
+                loss_per_epoch.append(loss.item())
+                avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
+
+                writer.add_scalar('Loss/train', loss.item(), total_steps)
+                writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
+
+            if done:
+                reward_per_epoch.append(total_reward_per_epoch)
+                writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
+                writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
+                writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
+                writer.add_scalar('No. Solves', no_solves, epoch)
+                writer.add_scalar('Steps', steps, epoch)
+                writer.add_scalar('Avg. Action value', action_values_cumulated / total_steps, epoch)
+                writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
+                writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
+                mode = 'train' if run_training else 'eval'
+                episode_summary = f"{datetime.now().strftime('%H:%M:%S')} {mode} E{epoch}: Done after {steps}" + \
+                                  f" steps, terminated: {terminated}, truncated: {truncated}," + \
+                                  f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f}" + \
+                                  f" sec, eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}"
+                logging.info(episode_summary)
+                if epoch % 25 == 0:
+                    print(episode_summary)
+                break
 
     if run_training:
         if not os.path.exists(os.path.join(os.getcwd(), "models")):
