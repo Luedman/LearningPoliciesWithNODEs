@@ -1,5 +1,7 @@
 import logging
 import random
+import sys
+from multiprocessing import Process
 
 import gym
 import torch
@@ -12,28 +14,59 @@ logging.basicConfig(filename='logfile.log', encoding='utf-8', level=logging.DEBU
 torch.manual_seed(1)
 random.seed(1)
 
+
+in_colab = 'google.colab' in sys.modules
 rcParams.update({'figure.autolayout': True})
 
-for env_name in ['CartPole-v1', 'MountainCarContinuous-v0']:
-    env = gym.make(env_name)
-    for model_type in ['nODENet']:
-        for nodes in [31]:
-            state, info = env.reset()
-            hp = HyperParameterWrapper(env=env,
-                                       model_class_label=model_type,
-                                       no_nodes=nodes,
-                                       learning_mode='eps_decay_linear',
-                                       no_dsteps=10,
-                                       epsilon_start=1.0,
-                                       epsilon_end=0.05,
-                                       learning_rate=0.001,
-                                       no_epochs=10,
-                                       gamma=0.95,
-                                       device_str="cpu",
-                                       batch_size=128,
-                                       tau=0.005,
-                                       label=env_name,
-                                       action_dpoints=10)
+env_label = 'CartPole-v1'
+hp1 = HyperParameterWrapper(env_label=env_label,
+                           model_class_label='nODENet',
+                           no_nodes=64,
+                           learning_mode='eps_decay_linear',
+                           no_dsteps=3,
+                           epsilon_start=1.0,
+                           epsilon_end=0.05,
+                           learning_rate=0.01,
+                           no_epochs=1000,
+                           gamma=0.99,
+                           device_str="cpu",
+                           batch_size=128,
+                           tau=0.005,
+                           label=env_label,
+                           action_dpoints=5,
+                           colab=in_colab)
 
-            run_model(env, hp, run_training=True)
-            run_model(env, hp, run_training=False)
+hp2 = HyperParameterWrapper(env_label=env_label,
+                            model_class_label='nODENet',
+                            no_nodes=64,
+                            learning_mode='eps_decay_linear',
+                            no_dsteps=10,
+                            epsilon_start=1.0,
+                            epsilon_end=0.05,
+                            learning_rate=0.01,
+                            no_epochs=1000,
+                            gamma=0.99,
+                            device_str="cpu",
+                            batch_size=128,
+                            tau=0.005,
+                            label=env_label,
+                            action_dpoints=5,
+                            colab=in_colab)
+
+
+def run_experiment(hp):
+    hp.env = gym.make(env_label)
+    state, info = hp.env.reset()
+    run_model(hp, run_training=True, start_episode=1)
+    run_model(hp, run_training=False)
+
+
+if __name__ == '__main__':
+    experiments_list = []
+    for hp in [hp1, hp2]:
+        experiment = Process(target=run_experiment, args=(hp,))
+        experiments_list.append(experiment)
+        experiment.start()
+
+    for experiment in experiments_list:
+        experiment.join()

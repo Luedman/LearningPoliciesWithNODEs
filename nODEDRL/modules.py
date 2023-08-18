@@ -11,13 +11,13 @@ import logging
 import matplotlib
 import numpy as np
 import torch
+import gym
 from gym.spaces import Box, Discrete
 from matplotlib import pyplot as plt
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
-
 from models import nODENet, DeepQNet
 
 is_ipython = 'inline' in matplotlib.get_backend()
@@ -26,7 +26,8 @@ Transition = namedtuple("Transition", ('state', 'action', 'next_state', 'reward'
 
 
 class HyperParameterWrapper:
-    def __init__(self, env,
+    def __init__(self,
+                 env_label,
                  epsilon_start: float,
                  model_class_label: str,
                  epsilon_end: float,
@@ -42,10 +43,12 @@ class HyperParameterWrapper:
                  period_length: int = 1,
                  device_str: str = 'cpu',
                  action_dpoints: int = 10,
-                 label: str = None):
+                 label: str = None,
+                 colab=False):
+        self.env = gym.make(env_label)
         self.model_class_label = model_class_label
-        self.obs_high = env.observation_space.high
-        self.obs_low = env.observation_space.low
+        self.obs_high = self.env.observation_space.high
+        self.obs_low = self.env.observation_space.low
         self.no_observations = len(self.obs_high)
         self.action_dpoints = action_dpoints
         self.gamma = gamma
@@ -64,24 +67,25 @@ class HyperParameterWrapper:
 
         self.period_length = period_length
         self.label = f'-{label}' if label is not None else ''
+        self.colab = colab
 
         if device_str is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device_str)
 
-        if type(env.action_space) is Box:
+        if type(self.env.action_space) is Box:
             self.action_type = "box"
-            self.action_low, self.action_high = env.action_space.low, env.action_space.high
+            self.action_low, self.action_high = self.env.action_space.low, self.env.action_space.high
             self.disc_action_space = torch.linspace(self.action_low[0],
                                                     self.action_high[0],
                                                     self.action_dpoints, device=self.device)
 
-        elif type(env.action_space) is Discrete:
+        elif type(self.env.action_space) is Discrete:
             self.action_type = "discrete"
-            self.action_low, self.action_high = (0, env.action_space.n)
-            self.disc_action_space = list(range(env.action_space.n))
-            self.action_dpoints = env.action_space.n
+            self.action_low, self.action_high = (0, self.env.action_space.n)
+            self.disc_action_space = list(range(self.env.action_space.n))
+            self.action_dpoints = self.env.action_space.n
 
     @property
     def model_label(self) -> str:
@@ -202,8 +206,8 @@ def write_tensorboard(writer, epoch, total_reward_per_epoch, eps_threshold,
     return writer
 
 
-def load_model(hp: HyperParameterWrapper) -> torch.nn.Module:
-    model_file_name = hp.model_training_label + "-policy-net.pth"
+def load_model(hp: HyperParameterWrapper, label="policy-net") -> torch.nn.Module:
+    model_file_name = hp.model_training_label + f"-{label}.pth"
     (model_type, n_observations, no_nodes, n_actions, device, _) = model_file_name.split('_')
     path = os.path.join(os.getcwd(), "models", model_file_name)
     if model_type == "nODENet":
@@ -245,10 +249,17 @@ def init_model(hp: HyperParameterWrapper) -> (ReplayMemory, torch.nn.Module, tor
     return replay_memory, policy_net, target_net, optimizer, scheduler
 
 
-def run_model(env, hp: HyperParameterWrapper, run_training: bool):
+def run_model(hp: HyperParameterWrapper,
+              run_training: bool,
+              start_episode: int = 1):
     if run_training:
         replay_memory, policy_net, target_net, optimizer, scheduler = init_model(hp)
         writer = make_tensorboard_writer('train', hp.model_training_label)
+        if start_episode > 1:
+            policy_net = load_model(hp)
+            target_net = load_model(hp, "target-net")
+        if not os.path.exists(os.path.join(os.getcwd(), "models")):
+            os.mkdir(os.path.join(os.getcwd(), "models"))
     else:
         replay_memory, policy_net, target_net, optimizer, scheduler = None, load_model(hp), None, None, None
         writer = make_tensorboard_writer('eval', hp.model_training_label)
@@ -256,87 +267,89 @@ def run_model(env, hp: HyperParameterWrapper, run_training: bool):
     loss_per_epoch, reward_per_epoch, avg_loss, avg_reward = [], [], [], []
     no_solves, total_steps, action_values_cumulated, loss = 0, 0, 0, 0
     start_time_total = time.time()
-    for epoch in range(1, hp.no_epochs + 1):
-        start_time = time.time()
-        state, info = env.reset()
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
-        total_reward_per_epoch = 0
-        for steps in count():
-            if (hp.label == '-MountainCarContinuous-v0' and (steps == 0 or steps % 5 == 0)) or \
-                    (hp.label == '-CartPole-v1'):
-                if run_training:
-                    action_idx_tensor, eps_threshold = select_action(state_tensor, epoch,
-                                                                     policy_net=policy_net, hp=hp)
+    for epoch in range(start_episode, hp.no_epochs + 1):
+        try:
+            start_time = time.time()
+            state, info = hp.env.reset()
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=hp.device)[:, None, None]
+            total_reward_per_epoch = 0
+            for steps in count():
+                if ('MountainCarContinuous-v0' in hp.label and (steps == 0 or steps % 5 == 0)) or \
+                        ('CartPole-v1' in hp.label):
+                    if run_training:
+                        action_idx_tensor, eps_threshold = select_action(state_tensor, epoch,
+                                                                         policy_net=policy_net, hp=hp)
+                    else:
+                        action_idx_tensor, eps_threshold = select_action(state_tensor, None,
+                                                                         policy_net=policy_net, hp=hp)
+                total_steps += 1
+                action_values_cumulated += action_idx_tensor
+
+                action_value = hp.disc_action_space[action_idx_tensor]
+                observation, reward, terminated, truncated, _ = hp.env.step(hp.conv_action(action_value))
+
+                done = (terminated or truncated)
+
+                if truncated:
+                    no_solves += 1
+                    next_state_tensor = None
+                elif terminated:
+                    next_state_tensor = None
                 else:
-                    action_idx_tensor, eps_threshold = select_action(state_tensor, None,
-                                                                     policy_net=policy_net, hp=hp)
-            total_steps += 1
-            action_values_cumulated += action_idx_tensor
+                    observation_tensor = torch.tensor(observation,
+                                                      dtype=torch.float32,
+                                                      device=hp.device,
+                                                      requires_grad=True)
+                    next_state_tensor = torch.reshape(observation_tensor, (len(hp.obs_high), 1, 1))
+                    steps += 1
 
-            action_value = hp.disc_action_space[action_idx_tensor]
-            observation, reward, terminated, truncated, _ = env.step(hp.conv_action(action_value))
-            # obs_log = np.log(np.abs(observation[1]))
-            # reward_adjustment = -100 if obs_log == -float('inf') else obs_log
-            # reward += (reward_adjustment/1000)
+                total_reward_per_epoch += reward
+                reward_tensor = torch.tensor([reward], device=hp.device)
+                if run_training:
+                    replay_memory.push(state_tensor, action_idx_tensor, next_state_tensor, reward_tensor)
+                state_tensor = next_state_tensor
 
-            done = (terminated or truncated)
+                if run_training and len(replay_memory) > hp.batch_size:
+                    loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer,
+                                                                  scheduler)
 
-            if truncated:
-                no_solves += 1
-                next_state_tensor = None
-            elif terminated:
-                next_state_tensor = None
-            else:
-                observation_tensor = torch.tensor(observation, dtype=torch.float32, device=hp.device,
-                                                  requires_grad=True)
-                next_state_tensor = torch.reshape(observation_tensor, (len(hp.obs_high), 1, 1))
-                steps += 1
+                    loss_per_epoch.append(loss.item())
+                    avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
 
-            total_reward_per_epoch += reward
-            reward_tensor = torch.tensor([reward], device=hp.device)
-            if run_training:
-                replay_memory.push(state_tensor, action_idx_tensor, next_state_tensor, reward_tensor)
-            state_tensor = next_state_tensor
+                    writer.add_scalar('Loss/train', loss.item(), total_steps)
+                    writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
 
-            if run_training and len(replay_memory) > hp.batch_size:
-                loss, target_net, policy_net = optimize_model(replay_memory, hp, policy_net, target_net, optimizer,
-                                                              scheduler)
-
-                loss_per_epoch.append(loss.item())
-                avg_loss.append(torch.mean(torch.mean(torch.tensor(loss_per_epoch[-20:]))))
-
-                writer.add_scalar('Loss/train', loss.item(), total_steps)
-                writer.add_scalar('Loss/train_avg', torch.mean(torch.tensor(loss_per_epoch[-200:])), total_steps)
-
-            if done:
-                reward_per_epoch.append(total_reward_per_epoch)
-                writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
-                writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
-                writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
-                writer.add_scalar('No. Solves', no_solves, epoch)
-                writer.add_scalar('Steps', steps, epoch)
-                writer.add_scalar('Avg. Action value', action_values_cumulated / total_steps, epoch)
-                writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
-                writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
-                mode = 'train' if run_training else 'eval'
-                episode_summary = f"{datetime.now().strftime('%H:%M:%S')} {mode} E{epoch}: Done after {steps}" + \
-                                  f" steps, terminated: {terminated}, truncated: {truncated}," + \
-                                  f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f}" + \
-                                  f" sec, eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}"
-                logging.info(episode_summary)
-                if epoch % 25 == 0:
-                    print(episode_summary)
-                break
-
-    if run_training:
-        if not os.path.exists(os.path.join(os.getcwd(), "models")):
-            os.mkdir(os.path.join(os.getcwd(), "models"))
-        model_label_tn = f"{hp.model_training_label}-target-net.pth"
-        model_label_pn = f"{hp.model_training_label}-policy-net.pth"
-        torch.save(target_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_tn))
-        torch.save(policy_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_pn))
-        print(f'{model_label_tn} saved')
-        print(f'{model_label_pn} saved')
+                if done:
+                    reward_per_epoch.append(total_reward_per_epoch)
+                    writer.add_scalar('Reward/train', total_reward_per_epoch, epoch)
+                    writer.add_scalar('Reward/train_avg', torch.mean(torch.tensor(reward_per_epoch[-20:])), epoch)
+                    writer.add_scalar('Epsilon Threshold/train', eps_threshold, epoch)
+                    writer.add_scalar('No. Solves', no_solves, epoch)
+                    writer.add_scalar('Steps', steps, epoch)
+                    writer.add_scalar('Avg. Action value', action_values_cumulated / total_steps, epoch)
+                    writer.add_scalar('Time/Epoch', time.time() - start_time, epoch)
+                    writer.add_scalar('Time/Total', time.time() - start_time_total, epoch)
+                    mode = 'train' if run_training else 'eval'
+                    episode_summary = f"{datetime.now().strftime('%H:%M:%S')} {mode} E{epoch}: Done after {steps}" + \
+                                      f" steps, terminated: {terminated}, truncated: {truncated}," + \
+                                      f" reward: {total_reward_per_epoch:.2f}, time: {time.time() - start_time:.2f}" + \
+                                      f" sec, eps: {eps_threshold:.2f}, loss {loss:.2f}, {hp.model_training_label}"
+                    logging.info(episode_summary)
+                    if epoch % 25 == 0:
+                        print(episode_summary)
+                        if run_training:
+                            model_label_tn = f"{hp.model_training_label}-target-net.pth"
+                            model_label_pn = f"{hp.model_training_label}-policy-net.pth"
+                            torch.save(target_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_tn))
+                            torch.save(policy_net.state_dict(), os.path.join(os.getcwd(), "models", model_label_pn))
+                    break
+        except Exception as e:
+            print('Error ' + str(e))
+            logging.error(e)
+            if hp.colab:
+                from google.colab import drive
+                drive.mount('/content/gdrive', force_remount=True)
+                print('Drive Mounted')
 
 
 def optimize_model(replay_memory: ReplayMemory,
@@ -383,56 +396,3 @@ def optimize_model(replay_memory: ReplayMemory,
     target_net.load_state_dict(target_net_state_dict)
 
     return loss, target_net, policy_net
-
-
-def generate_charts(epoch: int,
-                    replay_memory: ReplayMemory,
-                    policy_net: torch.nn.Module,
-                    hp: HyperParameterWrapper,
-                    loss_per_epoch: list,
-                    avg_loss: list,
-                    reward_per_epoch: list,
-                    avg_reward: list):
-    with torch.no_grad():
-        transitions = replay_memory.get_memory()
-        full_batch = Transition(*zip(*transitions))
-
-        net_actions = []
-        for state in full_batch.state:
-            action_idx = policy_net(state.T).argmax()
-            action_value = hp.disc_action_space[action_idx]
-            net_actions.append(torch.tensor(hp.conv_action(action_value)).reshape(1, ))
-
-        states_0 = torch.cat(full_batch.state, dim=1)[0, :]
-        states_1 = torch.cat(full_batch.state, dim=1)[1, :]
-        actions = torch.cat(full_batch.action)
-
-        fig = plt.figure(1)
-        ax = fig.add_subplot(projection='3d')
-        ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(), actions.cpu().numpy(),
-                   cmap=matplotlib.cm.coolwarm, label="actions played")
-        ax.scatter(states_0.cpu().numpy(), states_1.cpu().numpy(),
-                   torch.cat(net_actions).cpu().numpy(),
-                   cmap=matplotlib.cm.coolwarm, label="net policy")
-        ax.set_xlabel("state 0: position")
-        ax.set_ylabel("state 1: velocity")
-        ax.set_zlabel("action")
-        plt.legend()
-        plt.title(epoch)
-
-        plt.savefig("training_progress.png")
-        plt.close(fig)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    ax1.plot(loss_per_epoch, label="Loss per epoch")
-    ax1.plot(avg_loss, label="20 moving average loss")
-    ax1.set_title("Training Loss")
-    ax1.legend()
-
-    ax2.plot(reward_per_epoch, label="Reward per epoch")
-    ax2.plot(avg_reward, label="20 moving average reward")
-    ax2.set_title("Training Reward")
-    ax2.legend()
-
-    fig.savefig("training_loss.png")
-    plt.close(fig)
