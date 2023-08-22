@@ -7,7 +7,9 @@ import gym
 import torch
 from matplotlib import rcParams
 
-from modules import run_model, HyperParameterWrapper
+# from modules import run_model, HyperParameterWrapper
+from modules import HyperParameterWrapper, run_model
+from visualizations import draw_state
 
 logging.basicConfig(filename='logfile.log', encoding='utf-8', level=logging.DEBUG, filemode='w')
 
@@ -68,3 +70,5 @@ if __name__ == '__main__':
 
     for experiment in experiments_list:
         experiment.join()
+
+draw_state("nODENet_4_128_2_cpu_lr1e-06-y0.999-t0.0005-target-net.pth")

@@ -396,3 +396,6 @@ def optimize_model(replay_memory: ReplayMemory,
     target_net.load_state_dict(target_net_state_dict)
 
     return loss, target_net, policy_net
+
+
+

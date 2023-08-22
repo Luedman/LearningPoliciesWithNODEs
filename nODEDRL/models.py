@@ -17,14 +17,21 @@ class nODENet(torch.nn.Module):
 
         self.model_label = f"{self.model_type}_{n_observations}_{no_nodes}_{n_actions}_{device}"
 
-    def forward(self, state):
+    def forward(self, x):
         # inner_state = odeint(self.ode_module, state.flatten()[:, None].T,
         #                     torch.linspace(0, 1, 10, device=self.device))
-        inner_state = odeint(self.ode_module, state, torch.linspace(0, 1, self.no_dsteps, device=self.device),
+        inner_state = odeint(self.ode_module, x, torch.linspace(0, 1, self.no_dsteps, device=self.device),
                              atol=0.05, adjoint_options={'norm': 'seminorm'})
                              #rtol=0.01, atol=0.01)
         net_out = self.linear_out(inner_state[-1])
         return net_out
+
+    def forward_state(self, x):
+        inner_state = odeint(self.ode_module, x, torch.linspace(0, 1, self.no_dsteps, device=self.device),
+                             atol=0.05, adjoint_options={'norm': 'seminorm'})
+                             #rtol=0.01, atol=0.01)
+        net_out = self.linear_out(inner_state[-1])
+        return net_out, inner_state
 
 
 class nODEUnit(torch.nn.Module):
